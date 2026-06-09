@@ -5,27 +5,13 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - path: .env
-        required: false
+      - .env
     ports:
       - "${HOST_PORT:-7860}:${PORT:-7860}"
     volumes:
       - ${HOST_DATA_DIR:-./data}:/app/data
       - ${HOST_LOGS_DIR:-./logs}:/app/logs
     shm_size: "512m"
-    environment:
-      BASE_DIR: /app
-      DATA_DIR: /app/data
-      LOGS_DIR: /app/logs
-      ACCOUNTS_FILE: /app/data/accounts.json
-      USERS_FILE: /app/data/users.json
-      CAPTURES_FILE: /app/data/captures.json
-      CONFIG_FILE: /app/data/config.json
-      API_KEYS_FILE: /app/data/api_keys.json
-      CONTEXT_GENERATED_DIR: /app/data/context_files
-      CONTEXT_CACHE_FILE: /app/data/context_cache.json
-      UPLOADED_FILES_FILE: /app/data/uploaded_files.json
-      CONTEXT_AFFINITY_FILE: /app/data/session_affinity.json
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${PORT:-7860}/healthz || exit 1"]
       interval: 30s

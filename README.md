@@ -63,7 +63,7 @@ qwen2API converts Qwen Web capabilities into common API protocols and provides a
 
 ### 1. Pull From Docker Hub
 
-The Docker Hub deployment should use a compose YAML file. Create a clean runtime directory, write `.env`, write `docker-compose.yml`, pull the image, then start the service.
+For most deployments, use the Docker Hub image directly. Keep `data` and `logs` beside your compose file; Docker will mount them into the container so upgrades do not wipe your accounts, keys, or logs.
 
 ```bash
 mkdir qwen2api
@@ -71,7 +71,7 @@ cd qwen2api
 mkdir -p data logs
 ```
 
-Create `.env`:
+Create a small `.env`:
 
 ```env
 HOST_PORT=7860
@@ -90,27 +90,13 @@ services:
     restart: unless-stopped
     init: true
     env_file:
-      - path: .env
-        required: false
+      - .env
     ports:
       - "${HOST_PORT:-7860}:${PORT:-7860}"
     volumes:
       - ${HOST_DATA_DIR:-./data}:/app/data
       - ${HOST_LOGS_DIR:-./logs}:/app/logs
     shm_size: "512m"
-    environment:
-      BASE_DIR: /app
-      DATA_DIR: /app/data
-      LOGS_DIR: /app/logs
-      ACCOUNTS_FILE: /app/data/accounts.json
-      USERS_FILE: /app/data/users.json
-      CAPTURES_FILE: /app/data/captures.json
-      CONFIG_FILE: /app/data/config.json
-      API_KEYS_FILE: /app/data/api_keys.json
-      CONTEXT_GENERATED_DIR: /app/data/context_files
-      CONTEXT_CACHE_FILE: /app/data/context_cache.json
-      UPLOADED_FILES_FILE: /app/data/uploaded_files.json
-      CONTEXT_AFFINITY_FILE: /app/data/session_affinity.json
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${PORT:-7860}/healthz || exit 1"]
       interval: 30s
@@ -119,7 +105,9 @@ services:
       retries: 3
 ```
 
-Pull and start:
+You do not need to set paths for `accounts.json`, `api_keys.json`, or other internal files. The image already uses `/app/data` and `/app/logs`; the volume mapping above decides where those files live on your host.
+
+Start it:
 
 ```bash
 docker compose pull
