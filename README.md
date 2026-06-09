@@ -9,35 +9,39 @@
 </p>
 
 <p align="center">
-  <b>自托管千问 Web 协议转换网关</b><br />
-  OpenAI / Anthropic / Gemini 兼容接口，账号池，WebUI，文件上下文，图片和视频生成。
+  <b>Self-hosted Qwen Web protocol gateway</b><br />
+  OpenAI / Anthropic / Gemini compatible APIs, account pool, WebUI, file context, image generation, and video generation.
 </p>
 
 <p align="center">
-  <a href="./README_EN.md">English</a>
+  <a href="./README_CN.md">简体中文</a>
   ·
   <a href="https://hub.docker.com/r/yujunzhixue/qwen2api">Docker Hub</a>
+  ·
+  <a href="https://github.com/YuJunZhiXue/qwen2API">GitHub</a>
   ·
   <a href="https://t.me/qwen2api">Telegram</a>
 </p>
 
-## 版本说明
+## I. Project Overview
 
-| 版本 | 技术栈 | 状态 |
+qwen2API converts Qwen Web capabilities into common API protocols and provides a local WebUI for account, API key, runtime, image, and video management.
+
+| Version | Stack | Status |
 |---|---|---|
-| `v1.0` | Python + FastAPI/Uvicorn | 旧版实现，仅保留为历史说明。 |
-| `v2.0` | Go 后端 + React WebUI | 当前主线，启动更快，部署更简单，Docker 优先。 |
+| `v1.0` | Python + FastAPI/Uvicorn | Legacy implementation, kept only as historical context. |
+| `v2.0` | Go backend + React WebUI | Current mainline, faster startup, simpler runtime, Docker-first deployment. |
 
-## 能力概览
+Main capabilities:
 
-- OpenAI：`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/v1/files`、`/v1/images/generations`、`/v1/videos/generations`
-- Anthropic：`/v1/messages`、`/anthropic/v1/messages`、`/v1/messages/count_tokens`
-- Gemini：`/v1beta/models/{model}:generateContent`、`:streamGenerateContent`
-- WebUI：账号管理、API Key 管理、运行设置、模型测试、图片测试、视频测试
-- 账号池：多账号轮询、单账号并发、对话/图片/视频分用途限额冷却
-- 运维：`/healthz`、`/readyz`、`/keepalive`、Docker Healthcheck、GitHub Actions 多架构镜像
+- OpenAI-compatible endpoints: `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/v1/files`, `/v1/images/generations`, `/v1/videos/generations`.
+- Anthropic-compatible endpoints: `/v1/messages`, `/anthropic/v1/messages`, `/v1/messages/count_tokens`.
+- Gemini-compatible endpoints: `/v1beta/models/{model}:generateContent`, `/v1beta/models/{model}:streamGenerateContent`.
+- WebUI management for Qwen accounts, downstream API keys, runtime settings, model tests, image tests, and video tests.
+- Multi-account pool with per-account concurrency controls and separate chat/image/video rate-limit cooldowns.
+- Runtime probes: `/healthz`, `/readyz`, `/keepalive`.
 
-## 架构
+## II. Architecture
 
 ```mermaid
 flowchart LR
@@ -80,22 +84,25 @@ flowchart LR
   Docker --> App
 ```
 
-`./data` 是持久化状态，`./logs` 是运行日志。Docker 内部固定使用 `/app/data` 和 `/app/logs`，默认映射到宿主机当前目录的 `./data` 和 `./logs`。
+Runtime path rules:
 
-## Docker 部署
+- Docker stores data inside the container at `/app/data` and logs at `/app/logs`.
+- The default compose file maps those paths to `./data` and `./logs` in your current host directory.
+- For local non-Docker runs, empty path environment variables fall back to the current project directory.
 
-### 方式 A：Docker Hub 拉取
+## III. Docker Deployment
+
+### 1. Pull From Docker Hub With Compose
+
+This is the recommended server deployment path. Create a directory, write a compose YAML that points to the Docker Hub image, pull the image, then start it.
 
 ```bash
 mkdir qwen2api
 cd qwen2api
 mkdir -p data logs
-curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/YuJunZhiXue/qwen2API/main/docker-compose.yml
-curl -fsSL -o .env.example https://raw.githubusercontent.com/YuJunZhiXue/qwen2API/main/.env.example
-cp .env.example .env
 ```
 
-编辑 `.env`，至少填写：
+Create `.env`:
 
 ```env
 HOST_PORT=7860
@@ -104,20 +111,62 @@ HOST_LOGS_DIR=./logs
 ADMIN_KEY=change-this-to-a-strong-random-key
 ```
 
-启动：
+Create `docker-compose.yml`:
+
+```yaml
+services:
+  qwen2api:
+    image: ${QWEN2API_IMAGE:-yujunzhixue/qwen2api:latest}
+    container_name: qwen2api
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${HOST_PORT:-7860}:${PORT:-7860}"
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/app/data
+      - ${HOST_LOGS_DIR:-./logs}:/app/logs
+    shm_size: "512m"
+    environment:
+      BASE_DIR: /app
+      DATA_DIR: /app/data
+      LOGS_DIR: /app/logs
+      ACCOUNTS_FILE: /app/data/accounts.json
+      USERS_FILE: /app/data/users.json
+      CAPTURES_FILE: /app/data/captures.json
+      CONFIG_FILE: /app/data/config.json
+      API_KEYS_FILE: /app/data/api_keys.json
+      CONTEXT_GENERATED_DIR: /app/data/context_files
+      CONTEXT_CACHE_FILE: /app/data/context_cache.json
+      UPLOADED_FILES_FILE: /app/data/uploaded_files.json
+      CONTEXT_AFFINITY_FILE: /app/data/session_affinity.json
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${PORT:-7860}/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+```
+
+Pull and start:
 
 ```bash
+docker compose pull
 docker compose up -d
 docker compose logs -f qwen2api
 ```
 
-访问：
+Open:
 
-- WebUI：`http://127.0.0.1:7860`
-- 健康检查：`http://127.0.0.1:7860/healthz`
-- 保活探针：`http://127.0.0.1:7860/keepalive`
+- WebUI: `http://127.0.0.1:7860`
+- Health check: `http://127.0.0.1:7860/healthz`
+- Keepalive probe: `http://127.0.0.1:7860/keepalive`
 
-### 方式 B：本地 Docker 编译
+### 2. Build Locally With Docker
+
+Use this when you changed the source code and want to run your own local image.
 
 ```bash
 git clone https://github.com/YuJunZhiXue/qwen2API.git
@@ -127,35 +176,59 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml build
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
 ```
 
-### 方式 C：GitHub Actions 打包 Docker
+### 3. Publish Docker Images With GitHub Actions
 
-仓库已包含 `.github/workflows/docker-publish.yml`：
+The repository includes `.github/workflows/docker-publish.yml`.
 
-- push 到 `main` 时构建 `latest` 和 `sha-*` 标签。
-- push `v*.*.*` tag 时构建版本标签。
-- 默认推送 GHCR：`ghcr.io/yujunzhixue/qwen2api`。
-- 配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN` 后同时推送 Docker Hub：`yujunzhixue/qwen2api`。
+- Push to `main`: builds `latest` and `sha-*`.
+- Push `v*.*.*` tags: builds semver tags.
+- Pushes to GHCR by default: `ghcr.io/yujunzhixue/qwen2api`.
+- Also pushes to Docker Hub when `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets are configured.
 
-## 本地开发运行
+## IV. Configuration
+
+Do not commit real secrets. `.env.example` intentionally contains empty values and commented examples only.
+
+| Variable | Description |
+|---|---|
+| `ADMIN_KEY` | WebUI and `/api/admin/*` management key. Set a strong private value. |
+| `QWEN_API_KEY`, `QWEN_API_KEYS`, `QWEN_API_KEY_N` | Runtime-only downstream API keys injected from env. They are not saved to `data/api_keys.json` and cannot be deleted from WebUI. |
+| `QWEN_ACCOUNT_N` | Runtime-only upstream Qwen account, format `token;optional-email;optional-password`. It is not saved to `data/accounts.json`. |
+| `KEEPALIVE_URL`, `KEEPALIVE_INTERVAL` | Optional background keepalive task. Env values lock the same WebUI settings. |
+| `HOST_DATA_DIR`, `HOST_LOGS_DIR` | Host paths mounted into Docker as `/app/data` and `/app/logs`. Defaults are `./data` and `./logs`. |
+| `DATA_DIR`, `LOGS_DIR` | Local non-Docker path overrides. Leave empty to use the current project directory. |
+
+Default data files:
+
+- `data/accounts.json`: Qwen accounts added from WebUI.
+- `data/api_keys.json`: downstream API keys created from WebUI.
+- `data/config.json`: runtime settings such as keepalive config.
+- `data/context_files/`: generated context files.
+- `logs/`: runtime logs.
+
+## V. Development Guide
+
+### 1. Requirements
+
+- Go `1.26`
+- Node.js `20+`
+- npm
+- Docker, only if you need container builds
+
+### 2. One-Command Local Startup
 
 ```powershell
 go run start-all.go
 ```
 
-或分别启动：
+### 3. Backend Development
 
 ```powershell
 cd backend
 go run .
 ```
 
-```powershell
-cd frontend
-npm ci
-npm run dev
-```
-
-验证：
+Verification:
 
 ```powershell
 cd backend
@@ -163,43 +236,51 @@ go test ./...
 go build -trimpath -ldflags="-s -w" -o ..\bin\qwen2api-backend.exe .
 ```
 
+### 4. Frontend Development
+
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
+
+Production build:
+
 ```powershell
 cd frontend
 npm run build
 ```
 
-## 配置说明
+### 5. Development Rules
 
-关键配置都在 `.env.example` 中有空值或注释示例。仓库示例不会包含真实 Key、Token、Cookie 或密码。
+- Keep the Go backend as the v2.0 runtime source of truth.
+- Do not reintroduce Python/FastAPI runtime files into the Go mainline.
+- Keep Docker data paths container-internal as `/app/data` and `/app/logs`; host paths should be controlled by compose volume mappings.
+- Do not commit `data/`, `logs/`, `.env`, real tokens, cookies, passwords, or downstream API keys.
+- Update README and `.env.example` when adding user-visible configuration.
 
-| 变量 | 说明 |
-|---|---|
-| `ADMIN_KEY` | WebUI 和 `/api/admin/*` 管理接口认证 Key，必须自行设置强随机值。 |
-| `QWEN_API_KEY` / `QWEN_API_KEYS` / `QWEN_API_KEY_N` | 从环境变量注入下游 API Key，不写入 `data/api_keys.json`，不能在 WebUI 删除。 |
-| `QWEN_ACCOUNT_N` | 从环境变量注入上游账号，格式为 `token;optional-email;optional-password`，不写入 `data/accounts.json`。 |
-| `KEEPALIVE_URL` / `KEEPALIVE_INTERVAL` | 后台保活任务。环境变量存在时会锁定 WebUI 中对应字段。 |
-| `HOST_DATA_DIR` / `HOST_LOGS_DIR` | Docker 宿主机数据和日志目录，默认当前目录下的 `./data`、`./logs`。 |
-| `DATA_DIR` / `LOGS_DIR` | 本地非 Docker 运行路径覆盖。留空时使用当前项目目录。Docker 中由 compose 固定为 `/app/data`、`/app/logs`。 |
+## VI. Contribution
 
-## 数据文件
+Contributions are welcome.
 
-默认文件位置：
+- Report bugs through GitHub Issues.
+- Submit feature requests through GitHub Issues.
+- Open pull requests for fixes and improvements.
+- Keep changes focused and include verification steps when possible.
 
-- `data/accounts.json`：WebUI 添加的上游账号。
-- `data/api_keys.json`：WebUI 创建的下游 API Key。
-- `data/config.json`：运行配置，例如 keepalive。
-- `data/context_files/`：上下文生成文件。
-- `logs/`：运行日志。
+Recommended pull request checklist:
 
-环境变量注入的账号和 Key 只存在于运行时，不会写回 JSON 文件。
+- `go test ./...` passes in `backend`.
+- `npm run build` passes in `frontend`.
+- Docker-related changes are reflected in `Dockerfile`, `docker-compose.yml`, and documentation.
+- No generated data, logs, or secrets are included.
 
-## 当前限制
+## VII. Other Information
 
-- `v2.0` 不再保留 Python FastAPI 后端入口。
-- 旧版“一键获取新号”不属于当前 Go 主线能力。
-- OpenAI Assistants/Realtime/Audio/Fine-tuning 等完整生态接口未实现。
-- 图片和视频限额来自 Qwen 账号自身额度；对话正常不代表图片或视频额度也可用。
-
-## License
+### License
 
 GPL-3.0
+
+### Acknowledgements
+
+- 特别鸣谢: [LinuxDo](https://linux.do/)
