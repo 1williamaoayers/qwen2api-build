@@ -59,8 +59,38 @@ export default function TokensPage() {
   }, [loadKeys])
 
   const copyToClipboard = async (text: string) => {
-    await navigator.clipboard.writeText(text)
-    setCopied(text)
+    const value = text.trim()
+    if (!value) {
+      toast.error("没有可复制的内容")
+      return
+    }
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value)
+      } else {
+        throw new Error("clipboard unavailable")
+      }
+    } catch {
+      try {
+        const textarea = document.createElement("textarea")
+        textarea.value = value
+        textarea.setAttribute("readonly", "")
+        textarea.style.position = "fixed"
+        textarea.style.left = "-9999px"
+        document.body.appendChild(textarea)
+        textarea.select()
+        const ok = document.execCommand("copy")
+        document.body.removeChild(textarea)
+        if (!ok) {
+          throw new Error("copy failed")
+        }
+      } catch {
+        toast.error("复制失败，请检查浏览器剪贴板权限（HTTP 环境可能受限，可改用 HTTPS 或 localhost 访问）")
+        return
+      }
+    }
+    setCopied(value)
+    toast.success("已复制到剪贴板")
     window.setTimeout(() => setCopied(null), 1800)
   }
 
