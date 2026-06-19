@@ -113,6 +113,7 @@ func TestEvaluateBrowserFetchUsesAbortTimeoutAndParsesSuccess(t *testing.T) {
 	}
 
 	status, body, err := evaluateBrowserFetch(
+		context.Background(),
 		evaluator,
 		http.MethodPost,
 		"/api/v2/chats/new",
@@ -156,6 +157,7 @@ func TestEvaluateBrowserFetchReportsAbortTimeout(t *testing.T) {
 	}
 
 	status, body, err := evaluateBrowserFetch(
+		context.Background(),
 		evaluator,
 		http.MethodPost,
 		"/api/v2/chats/new",
@@ -175,5 +177,37 @@ func TestEvaluateBrowserFetchReportsAbortTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "30000ms") {
 		t.Fatalf("error = %q, want timeout detail", err)
+	}
+}
+
+func TestEvaluateBrowserFetchReturnsContextTimeoutWhenEvaluateHangs(t *testing.T) {
+	t.Helper()
+	evaluator := func(expr string, arg ...any) (any, error) {
+		select {}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	status, body, err := evaluateBrowserFetch(
+		ctx,
+		evaluator,
+		http.MethodPost,
+		"/api/v2/chats/new",
+		map[string]any{"foo": "bar"},
+		"application/json",
+		"token-123",
+		30*time.Millisecond,
+	)
+	if err == nil {
+		t.Fatal("expected context timeout error, got nil")
+	}
+	if status != 0 {
+		t.Fatalf("status = %d, want 0", status)
+	}
+	if body != "" {
+		t.Fatalf("body = %q, want empty", body)
+	}
+	if !strings.Contains(err.Error(), "browser evaluate timeout") {
+		t.Fatalf("error = %q, want evaluate timeout detail", err)
 	}
 }

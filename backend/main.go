@@ -1382,6 +1382,7 @@ func parseCookiePairs(raw string) []pw.OptionalCookie {
 }
 
 func evaluateBrowserFetch(
+	ctx context.Context,
 	evaluate func(expr string, arg ...any) (any, error),
 	method, path string,
 	payload map[string]any,
@@ -1395,7 +1396,13 @@ func evaluateBrowserFetch(
 			timeoutMs = 1
 		}
 	}
-	result, err := evaluate(`async ({ method, path, payload, accept, token, timeoutMs }) => {
+	type evalResult struct {
+		value any
+		err   error
+	}
+	resultCh := make(chan evalResult, 1)
+	go func() {
+		value, err := evaluate(`async ({ method, path, payload, accept, token, timeoutMs }) => {
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
 		try {
@@ -1431,13 +1438,26 @@ func evaluateBrowserFetch(
 			clearTimeout(timer);
 		}
 	}`, map[string]any{
-		"method":    method,
-		"path":      path,
-		"payload":   payload,
-		"accept":    accept,
-		"token":     token,
-		"timeoutMs": timeoutMs,
-	})
+			"method":    method,
+			"path":      path,
+			"payload":   payload,
+			"accept":    accept,
+			"token":     token,
+			"timeoutMs": timeoutMs,
+		})
+		resultCh <- evalResult{value: value, err: err}
+	}()
+	var (
+		result any
+		err    error
+	)
+	select {
+	case <-ctx.Done():
+		return 0, "", fmt.Errorf("browser evaluate timeout after %dms: %w", timeoutMs, ctx.Err())
+	case res := <-resultCh:
+		result = res.value
+		err = res.err
+	}
 	if err != nil {
 		return 0, "", fmt.Errorf("browser fetch failed: %w", err)
 	}
@@ -1501,7 +1521,7 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 			fetchTimeout = 30 * time.Second
 		}
 		logInfo(app.logger, ctx, "浏览器上游请求开始", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "has_cookies", strings.TrimSpace(cookies) != "")
-		fetchStatus, fetchBody, err := evaluateBrowserFetch(page.Evaluate, method, path, payload, accept, token, fetchTimeout)
+		fetchStatus, fetchBody, err := evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)
 		if err != nil {
 			logWarn(app.logger, ctx, "浏览器上游请求失败", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "error", err)
 			return err
