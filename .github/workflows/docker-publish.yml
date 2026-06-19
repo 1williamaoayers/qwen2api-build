@@ -12,7 +12,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  GHCR_IMAGE: ghcr.io/yujunzhixue/qwen2api
+  GHCR_IMAGE: ghcr.io/1williamaoayers/qwen2api-build
   DOCKERHUB_IMAGE: yujunzhixue/qwen2api
 
 jobs:
