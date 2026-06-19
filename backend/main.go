@@ -1417,7 +1417,7 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 				credentials: 'include',
 				headers: {
 					'content-type': 'application/json',
-					...(token ? { authorization: `Bearer ${token}` } : {}),
+					...(token ? { authorization: 'Bearer ' + token } : {}),
 					...(accept ? { accept } : {}),
 				},
 				body: payload ? JSON.stringify(payload) : undefined,
