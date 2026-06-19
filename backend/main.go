@@ -167,6 +167,7 @@ func NewApp(settings Settings, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	app.client = NewQwenClient(app.accounts, settings, logger)
+	app.client.browserFetch = app.browserFetchQwen
 	app.chatPool = NewChatIDPool(app.client, app.accounts, settings, logger)
 	app.keepalive = NewKeepAliveService(logger)
 	return app, nil
@@ -1353,6 +1354,113 @@ func qwenCookieString(page pw.Page) string {
 		}
 	}
 	return strings.Join(parts, "; ")
+}
+
+func parseCookiePairs(raw string) []pw.OptionalCookie {
+	out := []pw.OptionalCookie{}
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if name == "" {
+			continue
+		}
+		out = append(out, pw.OptionalCookie{
+			Name:  name,
+			Value: value,
+			URL:   pw.String(qwenBaseURL),
+		})
+	}
+	return out
+}
+
+func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, path string, payload map[string]any, accept string, timeout time.Duration) (int, string, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	var (
+		status int
+		body   string
+	)
+	err := app.withBrowser(ctx, func(page pw.Page) error {
+		if parsed := parseCookiePairs(cookies); len(parsed) > 0 {
+			if err := page.Context().AddCookies(parsed); err != nil {
+				return fmt.Errorf("browser add cookies failed: %w", err)
+			}
+		}
+		if _, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{
+			WaitUntil: pw.WaitUntilStateDomcontentloaded,
+			Timeout:   pw.Float(30000),
+		}); err != nil {
+			return fmt.Errorf("browser goto qwen failed: %w", err)
+		}
+		if token != "" {
+			if _, err := page.Evaluate(`token => {
+				localStorage.setItem('token', token);
+				return true;
+			}`, token); err != nil {
+				return fmt.Errorf("browser set localStorage token failed: %w", err)
+			}
+		}
+		result, err := page.Evaluate(`async ({ method, path, payload, accept, token }) => {
+			const response = await fetch(path, {
+				method,
+				credentials: 'include',
+				headers: {
+					'content-type': 'application/json',
+					...(token ? { authorization: `Bearer ${token}` } : {}),
+					...(accept ? { accept } : {}),
+				},
+				body: payload ? JSON.stringify(payload) : undefined,
+			});
+			return {
+				status: response.status,
+				body: await response.text(),
+			};
+		}`, map[string]any{
+			"method":  method,
+			"path":    path,
+			"payload": payload,
+			"accept":  accept,
+			"token":   token,
+		})
+		if err != nil {
+			return fmt.Errorf("browser fetch failed: %w", err)
+		}
+		obj, ok := result.(map[string]any)
+		if !ok {
+			return fmt.Errorf("browser fetch returned unexpected payload type %T", result)
+		}
+		switch v := obj["status"].(type) {
+		case int:
+			status = v
+		case float64:
+			status = int(v)
+		case json.Number:
+			i, convErr := v.Int64()
+			if convErr != nil {
+				return fmt.Errorf("browser fetch returned invalid status: %w", convErr)
+			}
+			status = int(i)
+		default:
+			return fmt.Errorf("browser fetch returned unexpected status type %T", obj["status"])
+		}
+		body = anyString(obj["body"], "")
+		return nil
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	return status, body, nil
 }
 
 func findVerifyLinkViaMailPage(ctx context.Context, page pw.Page, email string) string {
@@ -2560,7 +2668,55 @@ func extractAPIToken(r *http.Request) string {
 }
 
 func (app *App) runCompletion(ctx context.Context, req StandardRequest, preferredEmail string) (CompletionResult, error) {
+	if !req.Stream && !req.ToolEnabled {
+		return app.runCompletionNonStreaming(ctx, req, preferredEmail)
+	}
 	return app.runCompletionWithHooks(ctx, req, preferredEmail, nil)
+}
+
+func (app *App) runCompletionNonStreaming(ctx context.Context, req StandardRequest, preferredEmail string) (CompletionResult, error) {
+	if req.BoundAccount != nil {
+		preferredEmail = req.BoundAccount.Email
+	}
+	if preferredEmail == "" {
+		preferredEmail = req.PreferredEmail
+	}
+	acc, chatID, reused, err := app.acquireCompletionChat(ctx, req, preferredEmail)
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	defer app.accounts.Release(acc)
+	defer asyncDeleteChat(app.client, acc.Token, acc.Cookies, chatID)
+	setRequestLogFields(ctx, "chat_id", chatID)
+	app.logInfo(ctx, "创建上游会话", "chat_type", req.ChatType, "prewarmed", reused, "mode", "non_stream")
+
+	payload := buildChatPayload(chatID, req.ResolvedModel, req.Prompt, false, req.UpstreamFiles, req.ChatType, nil, req.ThinkingEnabled, req.EnableSearch)
+	payload["stream"] = false
+	status, body, err := app.client.PostChatCompletionOnce(ctx, acc.Token, acc.Cookies, chatID, payload, 90*time.Second)
+	if err != nil {
+		app.classifyAccountError(acc, err)
+		app.logWarn(ctx, "上游非流式失败", "error", err)
+		return CompletionResult{}, err
+	}
+	if status != http.StatusOK {
+		err = fmt.Errorf("completion HTTP %d: %s", status, truncate(body, 500))
+		app.classifyAccountError(acc, err)
+		app.logWarn(ctx, "上游非流式状态异常", "status", status, "body", truncate(body, 240))
+		return CompletionResult{}, err
+	}
+	if failure := extractUpstreamFailure(body); failure != "" {
+		err = errors.New(failure)
+		app.classifyAccountError(acc, err)
+		app.logWarn(ctx, "上游非流式返回失败", "failure", failure)
+		return CompletionResult{}, err
+	}
+	result := completionResultFromUpstreamBody(body)
+	app.accounts.MarkSuccess(acc)
+	app.logInfo(ctx, "上游非流式完成", "answer_len", len(result.AnswerText), "reasoning_len", len(result.ReasoningText))
+	if result.AnswerText != "" || result.ReasoningText != "" {
+		app.logInfo(ctx, "上游非流式回复摘要", "answer_tail", promptTail(result.AnswerText, 600), "reasoning_tail", promptTail(result.ReasoningText, 300))
+	}
+	return result, nil
 }
 
 func (app *App) acquireCompletionChat(ctx context.Context, req StandardRequest, preferredEmail string) (*Account, string, bool, error) {
@@ -6214,6 +6370,71 @@ func extractUpstreamFailure(text string) string {
 	return out
 }
 
+func completionResultFromUpstreamBody(body string) CompletionResult {
+	answer, reasoning := extractCompletionTexts(body)
+	return CompletionResult{
+		AnswerText:    answer,
+		ReasoningText: reasoning,
+		FinishReason:  "stop",
+	}
+}
+
+func extractCompletionTexts(body string) (string, string) {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return "", ""
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+		answer, reasoning := collectCompletionTexts(decoded)
+		if answer != "" || reasoning != "" {
+			return answer, reasoning
+		}
+	}
+	if extractUpstreamFailure(trimmed) != "" {
+		return "", ""
+	}
+	return trimmed, ""
+}
+
+func collectCompletionTexts(value any) (string, string) {
+	answerParts := []string{}
+	reasoningParts := []string{}
+	seenAnswer := map[string]bool{}
+	seenReasoning := map[string]bool{}
+	appendPart := func(parts *[]string, seen map[string]bool, text string) {
+		text = strings.TrimSpace(text)
+		if text == "" || seen[text] {
+			return
+		}
+		seen[text] = true
+		*parts = append(*parts, text)
+	}
+	var walk func(any)
+	walk = func(node any) {
+		switch current := node.(type) {
+		case map[string]any:
+			for _, evt := range parseQwenEvent(current) {
+				appendPart(&answerParts, seenAnswer, evt.Content)
+				appendPart(&reasoningParts, seenReasoning, evt.ReasoningText)
+			}
+			appendPart(&answerParts, seenAnswer, responseStringifyContent(current["output_text"]))
+			appendPart(&answerParts, seenAnswer, responseStringifyContent(current["content"]))
+			appendPart(&answerParts, seenAnswer, firstString(current["answer"], current["text"]))
+			appendPart(&reasoningParts, seenReasoning, firstString(current["reasoning_content"], current["reasoning"], current["reasoning_text"], current["thinking"], current["thoughts"]))
+			for _, item := range current {
+				walk(item)
+			}
+		case []any:
+			for _, item := range current {
+				walk(item)
+			}
+		}
+	}
+	walk(value)
+	return strings.Join(answerParts, ""), strings.Join(reasoningParts, "")
+}
+
 func taskStatusFromBody(body string) string {
 	status := ""
 	forEachJSONFragment(body, func(value any) {
@@ -7829,6 +8050,7 @@ type QwenClient struct {
 	http     *http.Client
 	mu       sync.Mutex
 	deleted  map[string]bool
+	browserFetch func(ctx context.Context, token, cookies, method, path string, payload map[string]any, accept string, timeout time.Duration) (int, string, error)
 }
 
 type UpstreamEvent struct {
@@ -7980,7 +8202,16 @@ func (c *QwenClient) CreateChat(ctx context.Context, token, cookies, model, chat
 	ts := time.Now().Unix()
 	body := map[string]any{"title": fmt.Sprintf("api_%d", ts), "models": []string{model}, "chat_mode": "normal", "chat_type": normalizeUpstreamChatType(chatType), "timestamp": ts}
 	logInfo(c.logger, ctx, "开始创建上游会话", "model", model, "chat_type", chatType, "token", redactToken(token))
-	status, text, err := c.requestJSON(ctx, http.MethodPost, "/api/v2/chats/new", token, cookies, body, 30*time.Second)
+	var (
+		status int
+		text   string
+		err    error
+	)
+	if c.browserFetch != nil {
+		status, text, err = c.browserFetch(ctx, token, cookies, http.MethodPost, "/api/v2/chats/new", body, "application/json, text/plain, */*", 30*time.Second)
+	} else {
+		status, text, err = c.requestJSON(ctx, http.MethodPost, "/api/v2/chats/new", token, cookies, body, 30*time.Second)
+	}
 	if err != nil {
 		logWarn(c.logger, ctx, "创建上游会话请求失败", "model", model, "chat_type", chatType, "error", err)
 		return "", err
@@ -8185,6 +8416,23 @@ func (c *QwenClient) PostChatCompletionOnce(ctx context.Context, token, cookies,
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
+	}
+	if c.browserFetch != nil {
+		logInfo(c.logger, ctx, "开始上游非流式请求", "chat_id", chatID, "token", redactToken(token), "mode", "browser")
+		start := time.Now()
+		status, body, err := c.browserFetch(ctx, token, cookies, http.MethodPost, "/api/v2/chat/completions?chat_id="+chatID, payload, "application/json, text/plain, */*", 0)
+		attrs := []any{"chat_id", chatID, "status", status, "bytes", len(body), "duration_ms", time.Since(start).Milliseconds(), "mode", "browser"}
+		if err != nil {
+			logWarn(c.logger, ctx, "上游非流式请求失败", "chat_id", chatID, "duration_ms", time.Since(start).Milliseconds(), "mode", "browser", "error", err)
+			return 0, err.Error(), err
+		}
+		if status >= 400 {
+			attrs = append(attrs, "body", truncate(body, 240))
+			logWarn(c.logger, ctx, "上游非流式请求完成", attrs...)
+		} else {
+			logInfo(c.logger, ctx, "上游非流式请求完成", attrs...)
+		}
+		return status, body, nil
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
