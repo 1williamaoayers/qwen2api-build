@@ -1381,6 +1381,91 @@ func parseCookiePairs(raw string) []pw.OptionalCookie {
 	return out
 }
 
+func evaluateBrowserFetch(
+	evaluate func(expr string, arg ...any) (any, error),
+	method, path string,
+	payload map[string]any,
+	accept, token string,
+	timeout time.Duration,
+) (int, string, error) {
+	timeoutMs := 30000
+	if timeout > 0 {
+		timeoutMs = int(timeout / time.Millisecond)
+		if timeoutMs <= 0 {
+			timeoutMs = 1
+		}
+	}
+	result, err := evaluate(`async ({ method, path, payload, accept, token, timeoutMs }) => {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
+		try {
+			const response = await fetch(path, {
+				method,
+				credentials: 'include',
+				signal: controller.signal,
+				headers: {
+					'content-type': 'application/json',
+					...(token ? { authorization: 'Bearer ' + token } : {}),
+					...(accept ? { accept } : {}),
+				},
+				body: payload ? JSON.stringify(payload) : undefined,
+			});
+			const body = await response.text();
+			return {
+				ok: true,
+				status: response.status,
+				body,
+				url: response.url || '',
+			};
+		} catch (error) {
+			const name = error && typeof error === 'object' && 'name' in error ? String(error.name) : '';
+			const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error || 'unknown browser fetch error');
+			const timedOut = name === 'AbortError' || controller.signal.aborted;
+			return {
+				ok: false,
+				error: timedOut ? 'browser fetch timeout after ' + timeoutMs + 'ms' : message,
+				name,
+				timed_out: timedOut,
+			};
+		} finally {
+			clearTimeout(timer);
+		}
+	}`, map[string]any{
+		"method":    method,
+		"path":      path,
+		"payload":   payload,
+		"accept":    accept,
+		"token":     token,
+		"timeoutMs": timeoutMs,
+	})
+	if err != nil {
+		return 0, "", fmt.Errorf("browser fetch failed: %w", err)
+	}
+	obj, ok := result.(map[string]any)
+	if !ok {
+		return 0, "", fmt.Errorf("browser fetch returned unexpected payload type %T", result)
+	}
+	if okValue, _ := obj["ok"].(bool); !okValue {
+		return 0, "", errors.New(anyString(obj["error"], "browser fetch failed"))
+	}
+	var status int
+	switch v := obj["status"].(type) {
+	case int:
+		status = v
+	case float64:
+		status = int(v)
+	case json.Number:
+		i, convErr := v.Int64()
+		if convErr != nil {
+			return 0, "", fmt.Errorf("browser fetch returned invalid status: %w", convErr)
+		}
+		status = int(i)
+	default:
+		return 0, "", fmt.Errorf("browser fetch returned unexpected status type %T", obj["status"])
+	}
+	return status, anyString(obj["body"], ""), nil
+}
+
 func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, path string, payload map[string]any, accept string, timeout time.Duration) (int, string, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -1411,50 +1496,19 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 				return fmt.Errorf("browser set localStorage token failed: %w", err)
 			}
 		}
-		result, err := page.Evaluate(`async ({ method, path, payload, accept, token }) => {
-			const response = await fetch(path, {
-				method,
-				credentials: 'include',
-				headers: {
-					'content-type': 'application/json',
-					...(token ? { authorization: 'Bearer ' + token } : {}),
-					...(accept ? { accept } : {}),
-				},
-				body: payload ? JSON.stringify(payload) : undefined,
-			});
-			return {
-				status: response.status,
-				body: await response.text(),
-			};
-		}`, map[string]any{
-			"method":  method,
-			"path":    path,
-			"payload": payload,
-			"accept":  accept,
-			"token":   token,
-		})
+		fetchTimeout := timeout
+		if fetchTimeout <= 0 {
+			fetchTimeout = 30 * time.Second
+		}
+		logInfo(app.logger, ctx, "浏览器上游请求开始", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "has_cookies", strings.TrimSpace(cookies) != "")
+		fetchStatus, fetchBody, err := evaluateBrowserFetch(page.Evaluate, method, path, payload, accept, token, fetchTimeout)
 		if err != nil {
-			return fmt.Errorf("browser fetch failed: %w", err)
+			logWarn(app.logger, ctx, "浏览器上游请求失败", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "error", err)
+			return err
 		}
-		obj, ok := result.(map[string]any)
-		if !ok {
-			return fmt.Errorf("browser fetch returned unexpected payload type %T", result)
-		}
-		switch v := obj["status"].(type) {
-		case int:
-			status = v
-		case float64:
-			status = int(v)
-		case json.Number:
-			i, convErr := v.Int64()
-			if convErr != nil {
-				return fmt.Errorf("browser fetch returned invalid status: %w", convErr)
-			}
-			status = int(i)
-		default:
-			return fmt.Errorf("browser fetch returned unexpected status type %T", obj["status"])
-		}
-		body = anyString(obj["body"], "")
+		status = fetchStatus
+		body = fetchBody
+		logInfo(app.logger, ctx, "浏览器上游请求完成", "method", method, "path", path, "status", status, "bytes", len(body))
 		return nil
 	})
 	if err != nil {
@@ -1775,7 +1829,7 @@ func (p *ChatIDPool) Fill(ctx context.Context) {
 func (p *ChatIDPool) createWarmChat(ctx context.Context, acc Account, warmKey ModelWarmKey) {
 	fillCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-		chatID, err := p.client.CreateChat(fillCtx, acc.Token, acc.Cookies, warmKey.Model, warmKey.ChatType)
+	chatID, err := p.client.CreateChat(fillCtx, acc.Token, acc.Cookies, warmKey.Model, warmKey.ChatType)
 	if err != nil {
 		logWarn(p.logger, ctx, "预热会话创建失败", "account", acc.Email, "model", warmKey.Model, "chat_type", warmKey.ChatType, "error", err)
 		return
@@ -8044,12 +8098,12 @@ func latestHumanLineLen(prompt string) int {
 const qwenBaseURL = "https://chat.qwen.ai"
 
 type QwenClient struct {
-	pool     *AccountPool
-	settings Settings
-	logger   *slog.Logger
-	http     *http.Client
-	mu       sync.Mutex
-	deleted  map[string]bool
+	pool         *AccountPool
+	settings     Settings
+	logger       *slog.Logger
+	http         *http.Client
+	mu           sync.Mutex
+	deleted      map[string]bool
 	browserFetch func(ctx context.Context, token, cookies, method, path string, payload map[string]any, accept string, timeout time.Duration) (int, string, error)
 }
 

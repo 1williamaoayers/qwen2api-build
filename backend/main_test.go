@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestQwenHeadersIncludeCookieWhenProvided(t *testing.T) {
@@ -84,5 +85,95 @@ func TestRunCompletionNonStreamParsesJSONBody(t *testing.T) {
 	}
 	if got := result.AnswerText; got != "QWEN2API-LIVE-OK" {
 		t.Fatalf("AnswerText = %q, want %q", got, "QWEN2API-LIVE-OK")
+	}
+}
+
+func TestEvaluateBrowserFetchUsesAbortTimeoutAndParsesSuccess(t *testing.T) {
+	t.Helper()
+	var (
+		gotExpr string
+		gotArg  map[string]any
+	)
+	evaluator := func(expr string, arg ...any) (any, error) {
+		gotExpr = expr
+		if len(arg) != 1 {
+			t.Fatalf("arg len = %d, want 1", len(arg))
+		}
+		payload, ok := arg[0].(map[string]any)
+		if !ok {
+			t.Fatalf("arg type = %T, want map[string]any", arg[0])
+		}
+		gotArg = payload
+		return map[string]any{
+			"ok":     true,
+			"status": float64(200),
+			"body":   `{"success":true}`,
+			"url":    "https://chat.qwen.ai/api/v2/chats/new",
+		}, nil
+	}
+
+	status, body, err := evaluateBrowserFetch(
+		evaluator,
+		http.MethodPost,
+		"/api/v2/chats/new",
+		map[string]any{"foo": "bar"},
+		"application/json",
+		"token-123",
+		1500*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("evaluateBrowserFetch error: %v", err)
+	}
+	if status != 200 {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if body != `{"success":true}` {
+		t.Fatalf("body = %q, want success payload", body)
+	}
+	if !strings.Contains(gotExpr, "AbortController") {
+		t.Fatalf("expression missing AbortController: %s", gotExpr)
+	}
+	if !strings.Contains(gotExpr, "controller.abort") {
+		t.Fatalf("expression missing controller.abort: %s", gotExpr)
+	}
+	if got := gotArg["timeoutMs"]; got != 1500 {
+		t.Fatalf("timeoutMs = %#v, want 1500", got)
+	}
+	if got := gotArg["path"]; got != "/api/v2/chats/new" {
+		t.Fatalf("path = %#v, want /api/v2/chats/new", got)
+	}
+}
+
+func TestEvaluateBrowserFetchReportsAbortTimeout(t *testing.T) {
+	t.Helper()
+	evaluator := func(expr string, arg ...any) (any, error) {
+		return map[string]any{
+			"ok":        false,
+			"error":     "browser fetch timeout after 30000ms",
+			"name":      "AbortError",
+			"timed_out": true,
+		}, nil
+	}
+
+	status, body, err := evaluateBrowserFetch(
+		evaluator,
+		http.MethodPost,
+		"/api/v2/chats/new",
+		map[string]any{"foo": "bar"},
+		"application/json",
+		"token-123",
+		0,
+	)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if status != 0 {
+		t.Fatalf("status = %d, want 0", status)
+	}
+	if body != "" {
+		t.Fatalf("body = %q, want empty", body)
+	}
+	if !strings.Contains(err.Error(), "30000ms") {
+		t.Fatalf("error = %q, want timeout detail", err)
 	}
 }
