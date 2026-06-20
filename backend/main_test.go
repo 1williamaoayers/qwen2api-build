@@ -353,3 +353,15 @@ func TestShouldNavigateSharedBrowserPage(t *testing.T) {
 		t.Fatal("embedded mode should navigate")
 	}
 }
+
+func TestSharedBrowserFetchResponseURL(t *testing.T) {
+	if got := sharedBrowserFetchResponseURL("/api/v2/chats/new"); got != "https://chat.qwen.ai/api/v2/chats/new" {
+		t.Fatalf("sharedBrowserFetchResponseURL(relative) = %q", got)
+	}
+	if got := sharedBrowserFetchResponseURL("api/v2/chats/new"); got != "https://chat.qwen.ai/api/v2/chats/new" {
+		t.Fatalf("sharedBrowserFetchResponseURL(no-leading-slash) = %q", got)
+	}
+	if got := sharedBrowserFetchResponseURL("https://chat.qwen.ai/api/v2/chats/new?chat_id=1"); got != "https://chat.qwen.ai/api/v2/chats/new?chat_id=1" {
+		t.Fatalf("sharedBrowserFetchResponseURL(absolute) = %q", got)
+	}
+}

@@ -893,10 +893,11 @@ const (
 )
 
 var (
-	browserAutomationMu sync.Mutex
-	playwrightInstallMu sync.Mutex
-	playwrightInstalled bool
-	mailLinkKeywords    = []string{"qwen", "verify", "activate", "confirm", "aliyun", "alibaba", "qwenlm"}
+	browserAutomationMu  sync.Mutex
+	sharedBrowserFetchMu sync.Mutex
+	playwrightInstallMu  sync.Mutex
+	playwrightInstalled  bool
+	mailLinkKeywords     = []string{"qwen", "verify", "activate", "confirm", "aliyun", "alibaba", "qwenlm"}
 )
 
 type MailSession struct {
@@ -1674,6 +1675,20 @@ func browserFetchValueString(value any) string {
 	}
 }
 
+func sharedBrowserFetchResponseURL(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return qwenBaseURL
+	}
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return path
+	}
+	if strings.HasPrefix(path, "/") {
+		return qwenBaseURL + path
+	}
+	return qwenBaseURL + "/" + path
+}
+
 func truncateForLog(value string, limit int) string {
 	value = strings.TrimSpace(value)
 	if limit <= 0 || len(value) <= limit {
@@ -1683,6 +1698,29 @@ func truncateForLog(value string, limit int) string {
 		return value[:limit]
 	}
 	return value[:limit-3] + "..."
+}
+
+func triggerBrowserFetch(page pw.Page, method, path string, payload map[string]any, accept, token string) error {
+	_, err := page.Evaluate(`({ method, path, payload, accept, token }) => {
+		void fetch(path, {
+			method,
+			credentials: 'include',
+			headers: {
+				'content-type': 'application/json',
+				...(token ? { authorization: 'Bearer ' + token } : {}),
+				...(accept ? { accept } : {}),
+			},
+			body: payload ? JSON.stringify(payload) : undefined,
+		});
+		return true;
+	}`, map[string]any{
+		"method":  method,
+		"path":    path,
+		"payload": payload,
+		"accept":  accept,
+		"token":   token,
+	})
+	return err
 }
 
 func evaluateBrowserFetch(
@@ -1904,8 +1942,9 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 		body   string
 	)
 	err := app.withBrowser(ctx, func(page pw.Page) error {
+		sharedMode := normalizeLower(app.settings.BrowserMode) == "shared_cdp"
 		attachBrowserDebugHooks(app.logger, ctx, page)
-		if parsed := parseCookiePairs(cookies); len(parsed) > 0 && normalizeLower(app.settings.BrowserMode) != "shared_cdp" {
+		if parsed := parseCookiePairs(cookies); len(parsed) > 0 && !sharedMode {
 			if err := page.Context().AddCookies(parsed); err != nil {
 				return fmt.Errorf("browser add cookies failed: %w", err)
 			}
@@ -1945,15 +1984,47 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 			fetchTimeout = 30 * time.Second
 		}
 		logInfo(app.logger, ctx, "浏览器上游请求开始", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "has_cookies", strings.TrimSpace(cookies) != "")
-		fetchStatus, fetchBody, err := evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)
-		if err != nil {
+		var (
+			fetchStatus int
+			fetchBody   string
+			fetchErr    error
+		)
+		if sharedMode {
+			sharedBrowserFetchMu.Lock()
+			defer sharedBrowserFetchMu.Unlock()
+
+			responseURL := sharedBrowserFetchResponseURL(path)
+			resp, respErr := page.ExpectResponse(responseURL, func() error {
+				return triggerBrowserFetch(page, method, path, payload, accept, token)
+			}, pw.PageExpectResponseOptions{Timeout: pw.Float(float64(fetchTimeout / time.Millisecond))})
+			if respErr != nil {
+				fetchErr = fmt.Errorf("browser shared response wait failed: %w", respErr)
+			} else {
+				if finishErr := runBrowserStep(ctx, fetchTimeout, "response_finish", resp.Finished); finishErr != nil {
+					fetchErr = fmt.Errorf("browser shared response finish failed: %w", finishErr)
+				} else {
+					fetchStatus = resp.Status()
+					readErr := runBrowserStep(ctx, fetchTimeout, "response_body", func() error {
+						var textErr error
+						fetchBody, textErr = resp.Text()
+						return textErr
+					})
+					if readErr != nil {
+						fetchErr = fmt.Errorf("browser shared response body failed: %w", readErr)
+					}
+				}
+			}
+		} else {
+			fetchStatus, fetchBody, fetchErr = evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)
+		}
+		if fetchErr != nil {
 			if snapshot, snapErr := browserPageStateSummary(page); snapErr != nil {
 				logWarn(app.logger, ctx, "浏览器页面快照失败", "stage", "after_fetch_error", "error", snapErr)
 			} else {
 				logWarn(app.logger, ctx, "浏览器页面快照", "stage", "after_fetch_error", "page_state", snapshot)
 			}
-			logWarn(app.logger, ctx, "浏览器上游请求失败", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "error", err)
-			return err
+			logWarn(app.logger, ctx, "浏览器上游请求失败", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "error", fetchErr)
+			return fetchErr
 		}
 		status = fetchStatus
 		body = fetchBody
