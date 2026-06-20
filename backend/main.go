@@ -888,6 +888,16 @@ func maxInt(a, b int) int {
 	return b
 }
 
+func minDuration(a, b time.Duration) time.Duration {
+	if a <= 0 {
+		return b
+	}
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // ---- migrated from auth_browser.go ----
 const (
 	mailBaseURL = "https://mail.chatgpt.org.uk"
@@ -1707,7 +1717,7 @@ func sharedBrowserTargetURL(currentURL, chatID string) string {
 	chatID = strings.TrimSpace(chatID)
 	if chatID != "" {
 		targetChatURL := qwenBaseURL + "/c/" + url.PathEscape(chatID)
-		if strings.TrimSpace(sharedChatIDFromPath(currentURL)) == chatID {
+		if sharedBrowserOnTargetChat(currentURL, chatID) {
 			return currentURL
 		}
 		return targetChatURL
@@ -1716,6 +1726,14 @@ func sharedBrowserTargetURL(currentURL, chatID string) string {
 		return currentURL
 	}
 	return qwenBaseURL + "/"
+}
+
+func sharedBrowserOnTargetChat(currentURL, chatID string) bool {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return true
+	}
+	return strings.TrimSpace(sharedChatIDFromPath(currentURL)) == chatID
 }
 
 func sharedChatIDFromPath(path string) string {
@@ -1730,7 +1748,17 @@ func sharedChatIDFromPath(path string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(parsed.Query().Get("chat_id"))
+	if chatID := strings.TrimSpace(parsed.Query().Get("chat_id")); chatID != "" {
+		return chatID
+	}
+	pathValue := strings.Trim(strings.TrimSpace(parsed.Path), "/")
+	if strings.HasPrefix(pathValue, "c/") {
+		if chatID, err := url.PathUnescape(strings.TrimPrefix(pathValue, "c/")); err == nil {
+			return strings.TrimSpace(chatID)
+		}
+		return strings.TrimSpace(strings.TrimPrefix(pathValue, "c/"))
+	}
+	return ""
 }
 
 func browserPromptFromPayload(payload map[string]any) string {
@@ -1891,6 +1919,29 @@ func (app *App) sharedBrowserDOMCompletion(ctx context.Context, page pw.Page, ch
 			return err
 		}); err != nil {
 			return "", fmt.Errorf("browser goto shared chat failed: %w", err)
+		}
+	}
+	if chatID != "" {
+		navDeadline := time.Now().Add(minDuration(timeout, 20*time.Second))
+		for attempt := 1; ; attempt++ {
+			currentURL = strings.TrimSpace(page.URL())
+			if sharedBrowserOnTargetChat(currentURL, chatID) {
+				break
+			}
+			if time.Now().After(navDeadline) {
+				return "", fmt.Errorf("shared browser target chat not ready: want=%s got=%s", chatID, firstNonEmpty(currentURL, "-"))
+			}
+			logWarn(app.logger, ctx, "共享浏览器目标会话未就绪", "attempt", attempt, "want_chat_id", chatID, "current_url", firstNonEmpty(currentURL, "-"))
+			sleepWithContext(ctx, 1500*time.Millisecond)
+			if err := runBrowserStep(ctx, 30*time.Second, "retry_goto_shared_chat", func() error {
+				_, err := page.Goto(targetURL, pw.PageGotoOptions{
+					WaitUntil: pw.WaitUntilStateDomcontentloaded,
+					Timeout:   pw.Float(30000),
+				})
+				return err
+			}); err != nil {
+				return "", fmt.Errorf("browser retry goto shared chat failed: %w", err)
+			}
 		}
 	}
 	if _, err := page.WaitForSelector(textareaSelector, pw.PageWaitForSelectorOptions{Timeout: pw.Float(20000)}); err != nil {

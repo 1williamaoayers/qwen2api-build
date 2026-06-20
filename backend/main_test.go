@@ -459,6 +459,11 @@ func TestSharedChatIDFromPath(t *testing.T) {
 	if got != "abc-123" {
 		t.Fatalf("sharedChatIDFromPath() = %q, want abc-123", got)
 	}
+
+	got = sharedChatIDFromPath("https://chat.qwen.ai/c/path-chat-456")
+	if got != "path-chat-456" {
+		t.Fatalf("sharedChatIDFromPath(path) = %q, want path-chat-456", got)
+	}
 }
 
 func TestSharedBrowserTargetURL(t *testing.T) {
