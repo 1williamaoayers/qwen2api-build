@@ -1396,76 +1396,126 @@ func evaluateBrowserFetch(
 			timeoutMs = 1
 		}
 	}
+	jobID := randomID()
 	type evalResult struct {
 		value any
 		err   error
 	}
-	resultCh := make(chan evalResult, 1)
-	go func() {
-		value, err := evaluate(`async ({ method, path, payload, accept, token, timeoutMs }) => {
+	runEvaluate := func(expr string, args ...any) (any, error) {
+		resultCh := make(chan evalResult, 1)
+		go func() {
+			value, err := evaluate(expr, args...)
+			resultCh <- evalResult{value: value, err: err}
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("browser evaluate timeout after %dms: %w", timeoutMs, ctx.Err())
+		case res := <-resultCh:
+			if res.err != nil {
+				return nil, fmt.Errorf("browser fetch failed: %w", res.err)
+			}
+			return res.value, nil
+		}
+	}
+	if _, err := runEvaluate(`({ jobId, method, path, payload, accept, token, timeoutMs }) => {
+		const root = globalThis;
+		if (!root.__qwen2apiFetchJobs) {
+			root.__qwen2apiFetchJobs = Object.create(null);
+		}
+		root.__qwen2apiFetchJobs[jobId] = { done: false, startedAt: Date.now() };
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
-		try {
-			const response = await fetch(path, {
-				method,
-				credentials: 'include',
-				signal: controller.signal,
-				headers: {
-					'content-type': 'application/json',
-					...(token ? { authorization: 'Bearer ' + token } : {}),
-					...(accept ? { accept } : {}),
-				},
-				body: payload ? JSON.stringify(payload) : undefined,
-			});
-			const body = await response.text();
-			return {
-				ok: true,
-				status: response.status,
-				body,
-				url: response.url || '',
-			};
-		} catch (error) {
-			const name = error && typeof error === 'object' && 'name' in error ? String(error.name) : '';
-			const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error || 'unknown browser fetch error');
-			const timedOut = name === 'AbortError' || controller.signal.aborted;
-			return {
-				ok: false,
-				error: timedOut ? 'browser fetch timeout after ' + timeoutMs + 'ms' : message,
-				name,
-				timed_out: timedOut,
-			};
-		} finally {
-			clearTimeout(timer);
-		}
+		(async () => {
+			try {
+				const response = await fetch(path, {
+					method,
+					credentials: 'include',
+					signal: controller.signal,
+					headers: {
+						'content-type': 'application/json',
+						...(token ? { authorization: 'Bearer ' + token } : {}),
+						...(accept ? { accept } : {}),
+					},
+					body: payload ? JSON.stringify(payload) : undefined,
+				});
+				const body = await response.text();
+				root.__qwen2apiFetchJobs[jobId] = {
+					done: true,
+					ok: true,
+					status: response.status,
+					body,
+					url: response.url || '',
+				};
+			} catch (error) {
+				const name = error && typeof error === 'object' && 'name' in error ? String(error.name) : '';
+				const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error || 'unknown browser fetch error');
+				const timedOut = name === 'AbortError' || controller.signal.aborted;
+				root.__qwen2apiFetchJobs[jobId] = {
+					done: true,
+					ok: false,
+					error: timedOut ? 'browser fetch timeout after ' + timeoutMs + 'ms' : message,
+					name,
+					timed_out: timedOut,
+				};
+			} finally {
+				clearTimeout(timer);
+			}
+		})();
+		return true;
 	}`, map[string]any{
-			"method":    method,
-			"path":      path,
-			"payload":   payload,
-			"accept":    accept,
-			"token":     token,
-			"timeoutMs": timeoutMs,
-		})
-		resultCh <- evalResult{value: value, err: err}
-	}()
-	var (
-		result any
-		err    error
-	)
-	select {
-	case <-ctx.Done():
-		return 0, "", fmt.Errorf("browser evaluate timeout after %dms: %w", timeoutMs, ctx.Err())
-	case res := <-resultCh:
-		result = res.value
-		err = res.err
+		"jobId":     jobID,
+		"method":    method,
+		"path":      path,
+		"payload":   payload,
+		"accept":    accept,
+		"token":     token,
+		"timeoutMs": timeoutMs,
+	}); err != nil {
+		return 0, "", err
 	}
-	if err != nil {
-		return 0, "", fmt.Errorf("browser fetch failed: %w", err)
+	pollInterval := 100 * time.Millisecond
+	if timeoutMs < 100 {
+		pollInterval = 10 * time.Millisecond
 	}
-	obj, ok := result.(map[string]any)
-	if !ok {
-		return 0, "", fmt.Errorf("browser fetch returned unexpected payload type %T", result)
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for {
+		if ctx.Err() != nil {
+			return 0, "", fmt.Errorf("browser evaluate timeout after %dms: %w", timeoutMs, ctx.Err())
+		}
+		result, err := runEvaluate(`jobId => {
+			const root = globalThis;
+			const job = root.__qwen2apiFetchJobs && root.__qwen2apiFetchJobs[jobId];
+			if (!job) {
+				return { done: false, missing: true };
+			}
+			if (!job.done) {
+				return { done: false };
+			}
+			delete root.__qwen2apiFetchJobs[jobId];
+			return job;
+		}`, jobID)
+		if err != nil {
+			return 0, "", err
+		}
+		obj, ok := result.(map[string]any)
+		if !ok {
+			return 0, "", fmt.Errorf("browser fetch returned unexpected payload type %T", result)
+		}
+		done, _ := obj["done"].(bool)
+		if !done {
+			if time.Now().After(deadline) {
+				return 0, "", fmt.Errorf("browser evaluate timeout after %dms: context deadline exceeded", timeoutMs)
+			}
+			sleepWithContext(ctx, pollInterval)
+			continue
+		}
+		return parseBrowserFetchResult(obj)
 	}
-	if okValue, _ := obj["ok"].(bool); !okValue {
+}
+
+func parseBrowserFetchResult(obj map[string]any) (int, string, error) {
+	okValue, _ := obj["ok"].(bool)
+	if !okValue {
 		return 0, "", errors.New(anyString(obj["error"], "browser fetch failed"))
 	}
 	var status int
