@@ -258,6 +258,75 @@ func TestEvaluateBrowserFetchReturnsContextTimeoutWhenPollHangs(t *testing.T) {
 	}
 }
 
+type fakeSharedBrowserPromptEditor struct {
+	inputValue string
+	readValue  string
+	ops        []string
+}
+
+func (f *fakeSharedBrowserPromptEditor) Focus() error {
+	f.ops = append(f.ops, "focus")
+	return nil
+}
+
+func (f *fakeSharedBrowserPromptEditor) Press(key string) error {
+	f.ops = append(f.ops, "press:"+key)
+	if key == "Backspace" {
+		f.inputValue = ""
+	}
+	if key == "Enter" {
+		f.ops = append(f.ops, "submit")
+	}
+	return nil
+}
+
+func (f *fakeSharedBrowserPromptEditor) PressSequentially(text string) error {
+	f.ops = append(f.ops, "type:"+text)
+	f.inputValue = text
+	return nil
+}
+
+func (f *fakeSharedBrowserPromptEditor) InputValue() (string, error) {
+	f.ops = append(f.ops, "read")
+	if f.readValue != "" {
+		return f.readValue, nil
+	}
+	return f.inputValue, nil
+}
+
+func TestSubmitSharedBrowserPromptUsesKeyboardSequence(t *testing.T) {
+	editor := &fakeSharedBrowserPromptEditor{inputValue: "stale"}
+
+	if err := submitSharedBrowserPrompt(editor, "Reply with exactly: QWEN2API-LIVE-OK"); err != nil {
+		t.Fatalf("submitSharedBrowserPrompt error: %v", err)
+	}
+
+	wantOps := []string{
+		"focus",
+		"press:ControlOrMeta+A",
+		"press:Backspace",
+		"type:Reply with exactly: QWEN2API-LIVE-OK",
+		"read",
+		"press:Enter",
+		"submit",
+	}
+	if strings.Join(editor.ops, "|") != strings.Join(wantOps, "|") {
+		t.Fatalf("ops = %v, want %v", editor.ops, wantOps)
+	}
+}
+
+func TestSubmitSharedBrowserPromptRejectsInputMismatch(t *testing.T) {
+	editor := &fakeSharedBrowserPromptEditor{readValue: "different"}
+
+	err := submitSharedBrowserPrompt(editor, "Reply with exactly: QWEN2API-LIVE-OK")
+	if err == nil {
+		t.Fatal("expected input mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "input value mismatch") {
+		t.Fatalf("error = %q, want input mismatch detail", err)
+	}
+}
+
 func TestEvaluateBrowserFetchReturnsTraceWhenJobNeverCompletes(t *testing.T) {
 	t.Helper()
 	call := 0

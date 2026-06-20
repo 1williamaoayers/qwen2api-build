@@ -1768,30 +1768,113 @@ func extractLatestSharedBrowserAnswer(raw string) string {
 	return strings.TrimSpace(tail)
 }
 
+type sharedBrowserPromptEditor interface {
+	Focus() error
+	Press(key string) error
+	PressSequentially(text string) error
+	InputValue() (string, error)
+}
+
+type playwrightSharedBrowserPromptEditor struct {
+	locator pw.Locator
+}
+
+func (e playwrightSharedBrowserPromptEditor) Focus() error {
+	return e.locator.Focus(pw.LocatorFocusOptions{Timeout: pw.Float(10000)})
+}
+
+func (e playwrightSharedBrowserPromptEditor) Press(key string) error {
+	return e.locator.Press(key, pw.LocatorPressOptions{Timeout: pw.Float(10000)})
+}
+
+func (e playwrightSharedBrowserPromptEditor) PressSequentially(text string) error {
+	return e.locator.PressSequentially(text)
+}
+
+func (e playwrightSharedBrowserPromptEditor) InputValue() (string, error) {
+	return e.locator.InputValue(pw.LocatorInputValueOptions{Timeout: pw.Float(5000)})
+}
+
+func submitSharedBrowserPrompt(editor sharedBrowserPromptEditor, prompt string) error {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return errors.New("shared browser DOM completion missing prompt")
+	}
+	if err := editor.Focus(); err != nil {
+		return fmt.Errorf("focus prompt input failed: %w", err)
+	}
+	if err := editor.Press("ControlOrMeta+A"); err != nil {
+		return fmt.Errorf("select prompt input failed: %w", err)
+	}
+	if err := editor.Press("Backspace"); err != nil {
+		return fmt.Errorf("clear prompt input failed: %w", err)
+	}
+	if err := editor.PressSequentially(prompt); err != nil {
+		return fmt.Errorf("type prompt failed: %w", err)
+	}
+	currentValue, err := editor.InputValue()
+	if err != nil {
+		return fmt.Errorf("read prompt input failed: %w", err)
+	}
+	if strings.TrimSpace(currentValue) != prompt {
+		return fmt.Errorf("input value mismatch after typing: got=%q want=%q", truncateForLog(currentValue, 120), truncateForLog(prompt, 120))
+	}
+	if err := editor.Press("Enter"); err != nil {
+		return fmt.Errorf("submit prompt failed: %w", err)
+	}
+	return nil
+}
+
 func (app *App) sharedBrowserDOMCompletion(ctx context.Context, page pw.Page, chatID, prompt string, timeout time.Duration) (string, error) {
 	chatID = strings.TrimSpace(chatID)
 	prompt = strings.TrimSpace(prompt)
-	if chatID == "" {
-		return "", errors.New("shared browser DOM completion missing chat_id")
-	}
 	if prompt == "" {
 		return "", errors.New("shared browser DOM completion missing prompt")
 	}
 	if timeout <= 0 {
 		timeout = 90 * time.Second
 	}
-	targetURL := qwenBaseURL + "/c/" + url.PathEscape(chatID)
-	if err := runBrowserStep(ctx, 30*time.Second, "goto_shared_chat", func() error {
-		_, err := page.Goto(targetURL, pw.PageGotoOptions{
-			WaitUntil: pw.WaitUntilStateDomcontentloaded,
-			Timeout:   pw.Float(30000),
-		})
-		return err
-	}); err != nil {
-		return "", fmt.Errorf("browser goto shared chat failed: %w", err)
+
+	textareaSelector := `textarea.message-input-textarea`
+	if err := page.BringToFront(); err != nil {
+		logWarn(app.logger, ctx, "共享浏览器标签置前失败", "error", err)
 	}
-	if _, err := page.WaitForSelector(`textarea.message-input-textarea`, pw.PageWaitForSelectorOptions{Timeout: pw.Float(20000)}); err != nil {
+	currentURL := strings.TrimSpace(page.URL())
+	targetURL := currentURL
+	switch {
+	case strings.HasPrefix(currentURL, qwenBaseURL+"/"):
+		targetURL = currentURL
+	case chatID != "":
+		targetURL = qwenBaseURL + "/c/" + url.PathEscape(chatID)
+	default:
+		targetURL = qwenBaseURL + "/"
+	}
+	if !strings.HasPrefix(currentURL, qwenBaseURL+"/") || currentURL == "" {
+		if err := runBrowserStep(ctx, 30*time.Second, "goto_shared_chat", func() error {
+			_, err := page.Goto(targetURL, pw.PageGotoOptions{
+				WaitUntil: pw.WaitUntilStateDomcontentloaded,
+				Timeout:   pw.Float(30000),
+			})
+			return err
+		}); err != nil {
+			return "", fmt.Errorf("browser goto shared chat failed: %w", err)
+		}
+	}
+	if _, err := page.WaitForSelector(textareaSelector, pw.PageWaitForSelectorOptions{Timeout: pw.Float(20000)}); err != nil {
 		return "", fmt.Errorf("browser textarea not ready: %w", err)
+	}
+	if inputState, evalErr := page.Evaluate(`selector => {
+		const el = document.querySelector(selector);
+		return {
+			url: location.href,
+			hasInput: !!el,
+			value: el instanceof HTMLTextAreaElement ? el.value : '',
+			answerCount: document.querySelectorAll('.response-message-content.t2t.phase-answer').length,
+		};
+	}`, textareaSelector); evalErr != nil {
+		logWarn(app.logger, ctx, "共享浏览器输入框初始快照失败", "error", evalErr)
+	} else {
+		logInfo(app.logger, ctx, "共享浏览器输入框初始快照", "state", inputState)
 	}
 	baselineRaw, err := page.Evaluate(`() => {
 		return Array.from(document.querySelectorAll('.response-message-content.t2t.phase-answer'))
@@ -1805,11 +1888,21 @@ func (app *App) sharedBrowserDOMCompletion(ctx context.Context, page pw.Page, ch
 	if items, ok := baselineRaw.([]any); ok {
 		baselineCount = len(items)
 	}
-	if err := page.Fill(`textarea.message-input-textarea`, prompt, pw.PageFillOptions{Timeout: pw.Float(10000)}); err != nil {
-		return "", fmt.Errorf("browser fill prompt failed: %w", err)
+	editor := playwrightSharedBrowserPromptEditor{locator: page.Locator(textareaSelector)}
+	if err := submitSharedBrowserPrompt(editor, prompt); err != nil {
+		return "", err
 	}
-	if err := page.Press(`textarea.message-input-textarea`, "Enter"); err != nil {
-		return "", fmt.Errorf("browser submit prompt failed: %w", err)
+	if submitState, evalErr := page.Evaluate(`selector => {
+		const el = document.querySelector(selector);
+		return {
+			url: location.href,
+			valueLen: el instanceof HTMLTextAreaElement ? el.value.length : -1,
+			answerCount: document.querySelectorAll('.response-message-content.t2t.phase-answer').length,
+		};
+	}`, textareaSelector); evalErr != nil {
+		logWarn(app.logger, ctx, "共享浏览器提交后快照失败", "error", evalErr)
+	} else {
+		logInfo(app.logger, ctx, "共享浏览器提交后快照", "state", submitState, "baseline_count", baselineCount, "prompt_len", len(prompt))
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
