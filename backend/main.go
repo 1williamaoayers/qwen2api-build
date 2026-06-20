@@ -1691,6 +1691,10 @@ func sharedBrowserFetchResponseURL(path string) string {
 }
 
 func shouldUseSharedBrowserEvaluateFetch(mode string) bool {
+	return false
+}
+
+func shouldUseSharedBrowserDirectRequest(mode string) bool {
 	return normalizeLower(mode) == "shared_cdp"
 }
 
@@ -2247,7 +2251,7 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 		} else {
 			logInfo(app.logger, ctx, "浏览器页面快照", "stage", "after_goto", "page_state", snapshot)
 		}
-		if token != "" {
+		if token != "" && !sharedMode {
 			if _, err := page.Evaluate(`token => {
 				localStorage.setItem('token', token);
 				return true;
@@ -2270,7 +2274,23 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 			fetchBody   string
 			fetchErr    error
 		)
-		if shouldUseSharedBrowserEvaluateFetch(app.settings.BrowserMode) {
+		if shouldUseSharedBrowserDirectRequest(app.settings.BrowserMode) {
+			sharedBrowserFetchMu.Lock()
+			liveToken := strings.TrimSpace(localStorageToken(page))
+			liveCookies := strings.TrimSpace(qwenCookieString(page))
+			sharedBrowserFetchMu.Unlock()
+			if liveToken != "" {
+				token = liveToken
+			}
+			if liveCookies != "" {
+				cookies = liveCookies
+			}
+			logInfo(app.logger, ctx, "共享浏览器认证已同步",
+				"token_from_page", liveToken != "",
+				"cookie_bytes", len(cookies),
+			)
+			fetchStatus, fetchBody, fetchErr = app.client.requestJSON(ctx, method, path, token, cookies, payload, fetchTimeout)
+		} else if shouldUseSharedBrowserEvaluateFetch(app.settings.BrowserMode) {
 			sharedBrowserFetchMu.Lock()
 			defer sharedBrowserFetchMu.Unlock()
 			fetchStatus, fetchBody, fetchErr = evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)

@@ -356,11 +356,20 @@ func TestShouldNavigateSharedBrowserPage(t *testing.T) {
 }
 
 func TestShouldUseSharedBrowserEvaluateFetch(t *testing.T) {
-	if !shouldUseSharedBrowserEvaluateFetch("shared_cdp") {
-		t.Fatal("shared_cdp should use shared page evaluate fetch strategy")
+	if shouldUseSharedBrowserEvaluateFetch("shared_cdp") {
+		t.Fatal("shared_cdp should not use shared page evaluate fetch strategy")
 	}
 	if shouldUseSharedBrowserEvaluateFetch("embedded") {
 		t.Fatal("embedded mode should not use shared page evaluate fetch strategy")
+	}
+}
+
+func TestShouldUseSharedBrowserDirectRequest(t *testing.T) {
+	if !shouldUseSharedBrowserDirectRequest("shared_cdp") {
+		t.Fatal("shared_cdp should use shared browser direct request strategy")
+	}
+	if shouldUseSharedBrowserDirectRequest("embedded") {
+		t.Fatal("embedded mode should not use shared browser direct request strategy")
 	}
 }
 
