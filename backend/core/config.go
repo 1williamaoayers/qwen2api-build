@@ -12,6 +12,8 @@ const Version = "2.0.0-go"
 type Settings struct {
 	Port                          int
 	AdminKey                      string
+	BrowserMode                   string
+	BrowserCDPURL                 string
 	BrowserPoolSize               int
 	MaxInflightPerAccount         int
 	BrowserStreamTimeoutSeconds   int
@@ -50,6 +52,8 @@ func LoadSettings(baseDir string) Settings {
 	return Settings{
 		Port:                          EnvInt("PORT", 7860),
 		AdminKey:                      EnvString("ADMIN_KEY", ""),
+		BrowserMode:                   strings.TrimSpace(strings.ToLower(EnvString("BROWSER_MODE", "embedded"))),
+		BrowserCDPURL:                 strings.TrimSpace(EnvString("BROWSER_CDP_URL", "")),
 		BrowserPoolSize:               EnvInt("BROWSER_POOL_SIZE", 1),
 		MaxInflightPerAccount:         EnvIntAlias("MAX_INFLIGHT_PER_ACCOUNT", "MAX_INFLIGHT", 2),
 		BrowserStreamTimeoutSeconds:   EnvInt("BROWSER_STREAM_TIMEOUT_SECONDS", 1800),

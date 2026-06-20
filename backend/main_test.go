@@ -317,3 +317,39 @@ func TestRunBrowserStepReturnsContextTimeoutWhenActionHangs(t *testing.T) {
 		t.Fatalf("error = %q, want goto timeout detail", err)
 	}
 }
+
+func TestLoadSettingsReadsSharedBrowserEnv(t *testing.T) {
+	t.Setenv("BROWSER_MODE", "shared_cdp")
+	t.Setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
+
+	settings := LoadSettings()
+
+	if settings.BrowserMode != "shared_cdp" {
+		t.Fatalf("BrowserMode = %q, want shared_cdp", settings.BrowserMode)
+	}
+	if settings.BrowserCDPURL != "http://127.0.0.1:9222" {
+		t.Fatalf("BrowserCDPURL = %q, want shared URL", settings.BrowserCDPURL)
+	}
+}
+
+func TestFindSharedQwenPageURLPrefersChatQwenAI(t *testing.T) {
+	urls := []string{
+		"https://www.google.com/",
+		"https://chat.qwen.ai/c/123",
+		"https://example.com/",
+	}
+
+	got := findSharedQwenPageURL(urls)
+	if got != "https://chat.qwen.ai/c/123" {
+		t.Fatalf("findSharedQwenPageURL() = %q, want chat.qwen.ai page", got)
+	}
+}
+
+func TestShouldNavigateSharedBrowserPage(t *testing.T) {
+	if shouldNavigateSharedBrowserPage("shared_cdp", "https://chat.qwen.ai/c/123") {
+		t.Fatal("shared qwen page should not navigate again")
+	}
+	if !shouldNavigateSharedBrowserPage("embedded", "") {
+		t.Fatal("embedded mode should navigate")
+	}
+}

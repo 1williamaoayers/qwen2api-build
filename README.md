@@ -115,6 +115,22 @@ docker compose up -d
 docker compose logs -f qwen2api
 ```
 
+If you want to reuse a host Chromium session that is already logged in, instead of launching a fresh headless browser inside the container, use the shared-browser override file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.shared-browser.yml pull
+docker compose -f docker-compose.yml -f docker-compose.shared-browser.yml up -d
+```
+
+Your `.env` should also include at least:
+
+```env
+BROWSER_MODE=shared_cdp
+BROWSER_CDP_URL=http://127.0.0.1:9222
+```
+
+This mode requires a host Chromium already running with `--remote-debugging-port=9222`, with an open and logged-in `https://chat.qwen.ai/` tab.
+
 Open:
 
 - WebUI: `http://127.0.0.1:7860`

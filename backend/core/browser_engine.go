@@ -1,11 +1,16 @@
 package core
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type BrowserOptions struct {
 	Headless bool
 	Timeout  time.Duration
 	PoolSize int
+	Mode     string
+	CDPURL   string
 }
 
 func DefaultBrowserOptions(settings Settings) BrowserOptions {
@@ -17,5 +22,15 @@ func DefaultBrowserOptions(settings Settings) BrowserOptions {
 	if poolSize <= 0 {
 		poolSize = 1
 	}
-	return BrowserOptions{Headless: true, Timeout: timeout, PoolSize: poolSize}
+	mode := strings.TrimSpace(strings.ToLower(settings.BrowserMode))
+	if mode == "" {
+		mode = "embedded"
+	}
+	return BrowserOptions{
+		Headless: true,
+		Timeout:  timeout,
+		PoolSize: poolSize,
+		Mode:     mode,
+		CDPURL:   strings.TrimSpace(settings.BrowserCDPURL),
+	}
 }

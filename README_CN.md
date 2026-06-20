@@ -115,6 +115,22 @@ docker compose up -d
 docker compose logs -f qwen2api
 ```
 
+如果你要复用宿主机已经登录的 Chromium 会话，而不是让容器内自己启动 headless 浏览器，使用共享浏览器覆盖文件：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.shared-browser.yml pull
+docker compose -f docker-compose.yml -f docker-compose.shared-browser.yml up -d
+```
+
+对应 `.env` 需至少增加：
+
+```env
+BROWSER_MODE=shared_cdp
+BROWSER_CDP_URL=http://127.0.0.1:9222
+```
+
+这个模式要求宿主机已有带 `--remote-debugging-port=9222` 的 Chromium，并且浏览器里已经打开并登录 `https://chat.qwen.ai/`。
+
 访问地址：
 
 - WebUI：`http://127.0.0.1:7860`

@@ -1212,6 +1212,13 @@ func (app *App) activateQwenAccount(ctx context.Context, acc Account) (Account, 
 }
 
 func (app *App) withBrowser(ctx context.Context, fn func(page pw.Page) error) error {
+	if normalizeLower(app.settings.BrowserMode) == "shared_cdp" {
+		return app.withSharedCDPBrowser(ctx, fn)
+	}
+	return app.withEmbeddedBrowser(ctx, fn)
+}
+
+func (app *App) withEmbeddedBrowser(ctx context.Context, fn func(page pw.Page) error) error {
 	if err := installPlaywrightBrowsers(app.logger); err != nil {
 		return fmt.Errorf("playwright install failed: %w", err)
 	}
@@ -1258,6 +1265,55 @@ func (app *App) withBrowser(ctx context.Context, fn func(page pw.Page) error) er
 		return ctx.Err()
 	}
 	return fn(page)
+}
+
+func (app *App) withSharedCDPBrowser(ctx context.Context, fn func(page pw.Page) error) error {
+	runner, err := pw.Run(&pw.RunOptions{SkipInstallBrowsers: true})
+	if err != nil {
+		return fmt.Errorf("playwright run failed: %w", err)
+	}
+	defer runner.Stop()
+
+	endpoint := strings.TrimSpace(app.settings.BrowserCDPURL)
+	if endpoint == "" {
+		return errors.New("shared browser mode requires BROWSER_CDP_URL")
+	}
+	browser, err := runner.Chromium.ConnectOverCDP(endpoint, pw.BrowserTypeConnectOverCDPOptions{
+		Timeout: pw.Float(15000),
+	})
+	if err != nil {
+		return fmt.Errorf("shared browser cdp connect failed: %w", err)
+	}
+
+	contexts := browser.Contexts()
+	if len(contexts) == 0 {
+		return errors.New("shared browser has no contexts")
+	}
+	pages := make([]pw.Page, 0, 4)
+	urls := make([]string, 0, 4)
+	for _, context := range contexts {
+		for _, page := range context.Pages() {
+			pages = append(pages, page)
+			urls = append(urls, strings.TrimSpace(page.URL()))
+		}
+	}
+	targetURL := findSharedQwenPageURL(urls)
+	if targetURL == "" {
+		return errors.New("shared browser mode requires an already-open chat.qwen.ai tab")
+	}
+	for _, page := range pages {
+		if strings.TrimSpace(page.URL()) != targetURL {
+			continue
+		}
+		page.SetDefaultTimeout(30000)
+		page.SetDefaultNavigationTimeout(30000)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		logInfo(app.logger, ctx, "共享浏览器页面已复用", "mode", "shared_cdp", "page_url", targetURL)
+		return fn(page)
+	}
+	return errors.New("shared browser target page disappeared before use")
 }
 
 func loginAndGetToken(ctx context.Context, page pw.Page, email, password string, timeout time.Duration) string {
@@ -1501,6 +1557,19 @@ func browserPageStateSummary(page pw.Page) (string, error) {
 		obj["cookieBytes"],
 		anyString(obj["bodyExcerpt"], ""),
 	), nil
+}
+
+func findSharedQwenPageURL(urls []string) string {
+	for _, raw := range urls {
+		parsed, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(parsed.Host, "chat.qwen.ai") {
+			return raw
+		}
+	}
+	return ""
 }
 
 func runBrowserStep(ctx context.Context, timeout time.Duration, action string, fn func() error) error {
@@ -1836,20 +1905,22 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 	)
 	err := app.withBrowser(ctx, func(page pw.Page) error {
 		attachBrowserDebugHooks(app.logger, ctx, page)
-		if parsed := parseCookiePairs(cookies); len(parsed) > 0 {
+		if parsed := parseCookiePairs(cookies); len(parsed) > 0 && normalizeLower(app.settings.BrowserMode) != "shared_cdp" {
 			if err := page.Context().AddCookies(parsed); err != nil {
 				return fmt.Errorf("browser add cookies failed: %w", err)
 			}
 			logInfo(app.logger, ctx, "浏览器cookies已注入", "cookie_count", len(parsed))
 		}
-		if err := runBrowserStep(ctx, 30*time.Second, "goto", func() error {
-			_, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{
-				WaitUntil: pw.WaitUntilStateCommit,
-				Timeout:   pw.Float(30000),
-			})
-			return err
-		}); err != nil {
-			return fmt.Errorf("browser goto qwen failed: %w", err)
+		if shouldNavigateSharedBrowserPage(app.settings.BrowserMode, page.URL()) {
+			if err := runBrowserStep(ctx, 30*time.Second, "goto", func() error {
+				_, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{
+					WaitUntil: pw.WaitUntilStateCommit,
+					Timeout:   pw.Float(30000),
+				})
+				return err
+			}); err != nil {
+				return fmt.Errorf("browser goto qwen failed: %w", err)
+			}
 		}
 		if snapshot, snapErr := browserPageStateSummary(page); snapErr != nil {
 			logWarn(app.logger, ctx, "浏览器页面快照失败", "stage", "after_goto", "error", snapErr)
@@ -1893,6 +1964,10 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 		return 0, "", err
 	}
 	return status, body, nil
+}
+
+func shouldNavigateSharedBrowserPage(mode, currentURL string) bool {
+	return !(normalizeLower(mode) == "shared_cdp" && strings.HasPrefix(strings.TrimSpace(currentURL), "https://chat.qwen.ai/"))
 }
 
 func findVerifyLinkViaMailPage(ctx context.Context, page pw.Page, email string) string {
@@ -2310,6 +2385,8 @@ type Settings struct {
 	Port                                   int
 	Workers                                int
 	AdminKey                               string
+	BrowserMode                            string
+	BrowserCDPURL                          string
 	BrowserPoolSize                        int
 	MaxInflightPerAccount                  int
 	BrowserStreamTimeoutSeconds            int
@@ -2371,6 +2448,8 @@ func LoadSettings() Settings {
 		Port:                                   envInt("PORT", 7860),
 		Workers:                                envInt("WORKERS", 1),
 		AdminKey:                               envString("ADMIN_KEY", ""),
+		BrowserMode:                            normalizeLower(envString("BROWSER_MODE", "embedded")),
+		BrowserCDPURL:                          strings.TrimSpace(envString("BROWSER_CDP_URL", "")),
 		BrowserPoolSize:                        envInt("BROWSER_POOL_SIZE", 1),
 		MaxInflightPerAccount:                  envIntAlias("MAX_INFLIGHT_PER_ACCOUNT", "MAX_INFLIGHT", 2),
 		BrowserStreamTimeoutSeconds:            envInt("BROWSER_STREAM_TIMEOUT_SECONDS", 1800),

@@ -1,0 +1,3 @@
+services:
+  qwen2api:
+    network_mode: host
