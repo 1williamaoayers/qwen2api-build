@@ -355,6 +355,15 @@ func TestShouldNavigateSharedBrowserPage(t *testing.T) {
 	}
 }
 
+func TestShouldUseSharedBrowserEvaluateFetch(t *testing.T) {
+	if !shouldUseSharedBrowserEvaluateFetch("shared_cdp") {
+		t.Fatal("shared_cdp should use shared page evaluate fetch strategy")
+	}
+	if shouldUseSharedBrowserEvaluateFetch("embedded") {
+		t.Fatal("embedded mode should not use shared page evaluate fetch strategy")
+	}
+}
+
 func TestSharedBrowserFetchResponseURL(t *testing.T) {
 	if got := sharedBrowserFetchResponseURL("/api/v2/chats/new"); got != "https://chat.qwen.ai/api/v2/chats/new" {
 		t.Fatalf("sharedBrowserFetchResponseURL(relative) = %q", got)

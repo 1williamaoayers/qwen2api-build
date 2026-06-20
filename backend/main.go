@@ -1690,6 +1690,10 @@ func sharedBrowserFetchResponseURL(path string) string {
 	return qwenBaseURL + "/" + path
 }
 
+func shouldUseSharedBrowserEvaluateFetch(mode string) bool {
+	return normalizeLower(mode) == "shared_cdp"
+}
+
 func truncateForLog(value string, limit int) string {
 	value = strings.TrimSpace(value)
 	if limit <= 0 || len(value) <= limit {
@@ -2266,10 +2270,10 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 			fetchBody   string
 			fetchErr    error
 		)
-		if sharedMode {
+		if shouldUseSharedBrowserEvaluateFetch(app.settings.BrowserMode) {
 			sharedBrowserFetchMu.Lock()
 			defer sharedBrowserFetchMu.Unlock()
-			fetchStatus, fetchBody, fetchErr = app.sharedBrowserFetchViaCDP(ctx, page, method, path, payload, accept, token, fetchTimeout)
+			fetchStatus, fetchBody, fetchErr = evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)
 		} else {
 			fetchStatus, fetchBody, fetchErr = evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)
 		}
