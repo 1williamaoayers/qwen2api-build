@@ -301,3 +301,19 @@ func TestEvaluateBrowserFetchReturnsTraceWhenJobNeverCompletes(t *testing.T) {
 		t.Fatalf("error = %q, want trace detail", err)
 	}
 }
+
+func TestRunBrowserStepReturnsContextTimeoutWhenActionHangs(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := runBrowserStep(ctx, 30*time.Millisecond, "goto", func() error {
+		select {}
+	})
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "browser goto timeout") {
+		t.Fatalf("error = %q, want goto timeout detail", err)
+	}
+}

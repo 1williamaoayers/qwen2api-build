@@ -1503,6 +1503,32 @@ func browserPageStateSummary(page pw.Page) (string, error) {
 	), nil
 }
 
+func runBrowserStep(ctx context.Context, timeout time.Duration, action string, fn func() error) error {
+	timeoutMs := int((30 * time.Second) / time.Millisecond)
+	stepCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		timeoutMs = int(timeout / time.Millisecond)
+		if timeoutMs <= 0 {
+			timeoutMs = 1
+		}
+		var stepCancel context.CancelFunc
+		stepCtx, stepCancel = context.WithTimeout(ctx, timeout)
+		cancel = stepCancel
+	}
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- fn()
+	}()
+	select {
+	case <-stepCtx.Done():
+		return fmt.Errorf("browser %s timeout after %dms: %w", strings.TrimSpace(action), timeoutMs, stepCtx.Err())
+	case err := <-resultCh:
+		return err
+	}
+}
+
 func browserFetchStateSummary(obj map[string]any) string {
 	if len(obj) == 0 {
 		return ""
@@ -1816,9 +1842,12 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 			}
 			logInfo(app.logger, ctx, "浏览器cookies已注入", "cookie_count", len(parsed))
 		}
-		if _, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{
-			WaitUntil: pw.WaitUntilStateDomcontentloaded,
-			Timeout:   pw.Float(30000),
+		if err := runBrowserStep(ctx, 30*time.Second, "goto", func() error {
+			_, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{
+				WaitUntil: pw.WaitUntilStateCommit,
+				Timeout:   pw.Float(30000),
+			})
+			return err
 		}); err != nil {
 			return fmt.Errorf("browser goto qwen failed: %w", err)
 		}
