@@ -1718,12 +1718,20 @@ func sharedChatIDFromPath(path string) string {
 }
 
 func browserPromptFromPayload(payload map[string]any) string {
-	items := anyList(payload["messages"])
-	for i := len(items) - 1; i >= 0; i-- {
-		msg, ok := items[i].(map[string]any)
-		if !ok {
-			continue
+	var items []map[string]any
+	switch v := payload["messages"].(type) {
+	case []any:
+		for _, raw := range v {
+			msg, ok := raw.(map[string]any)
+			if ok {
+				items = append(items, msg)
+			}
 		}
+	case []map[string]any:
+		items = v
+	}
+	for i := len(items) - 1; i >= 0; i-- {
+		msg := items[i]
 		if role := strings.TrimSpace(stringValue(msg, "role", "user")); role != "" && role != "user" {
 			continue
 		}
