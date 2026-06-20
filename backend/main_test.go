@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net"
@@ -363,5 +364,88 @@ func TestSharedBrowserFetchResponseURL(t *testing.T) {
 	}
 	if got := sharedBrowserFetchResponseURL("https://chat.qwen.ai/api/v2/chats/new?chat_id=1"); got != "https://chat.qwen.ai/api/v2/chats/new?chat_id=1" {
 		t.Fatalf("sharedBrowserFetchResponseURL(absolute) = %q", got)
+	}
+}
+
+func TestParseSharedCDPRequestEvent(t *testing.T) {
+	event := parseSharedCDPRequestEvent(map[string]any{
+		"requestId": "123.45",
+		"request": map[string]any{
+			"method": "post",
+			"url":    "https://chat.qwen.ai/api/v2/chats/new",
+		},
+	})
+
+	if event.RequestID != "123.45" {
+		t.Fatalf("RequestID = %q, want 123.45", event.RequestID)
+	}
+	if event.Method != "POST" {
+		t.Fatalf("Method = %q, want POST", event.Method)
+	}
+	if event.URL != "https://chat.qwen.ai/api/v2/chats/new" {
+		t.Fatalf("URL = %q, want target URL", event.URL)
+	}
+}
+
+func TestMatchesSharedCDPRequest(t *testing.T) {
+	event := sharedCDPRequestEvent{
+		RequestID: "123.45",
+		Method:    "POST",
+		URL:       "https://chat.qwen.ai/api/v2/chats/new",
+	}
+	if !matchesSharedCDPRequest(event, http.MethodPost, "https://chat.qwen.ai/api/v2/chats/new") {
+		t.Fatal("expected exact method and URL to match")
+	}
+	if matchesSharedCDPRequest(event, http.MethodGet, "https://chat.qwen.ai/api/v2/chats/new") {
+		t.Fatal("GET should not match POST event")
+	}
+	if matchesSharedCDPRequest(event, http.MethodPost, "https://chat.qwen.ai/api/v2/chat/completions") {
+		t.Fatal("different URL should not match")
+	}
+}
+
+func TestParseSharedCDPResponseEvent(t *testing.T) {
+	event := parseSharedCDPResponseEvent(map[string]any{
+		"requestId": "123.45",
+		"response": map[string]any{
+			"status": float64(200),
+			"url":    "https://chat.qwen.ai/api/v2/chats/new",
+		},
+	})
+
+	if event.RequestID != "123.45" {
+		t.Fatalf("RequestID = %q, want 123.45", event.RequestID)
+	}
+	if event.Status != 200 {
+		t.Fatalf("Status = %d, want 200", event.Status)
+	}
+	if event.URL != "https://chat.qwen.ai/api/v2/chats/new" {
+		t.Fatalf("URL = %q, want target URL", event.URL)
+	}
+}
+
+func TestDecodeSharedCDPResponseBodyPlain(t *testing.T) {
+	body, err := decodeSharedCDPResponseBody(map[string]any{
+		"body":          `{"success":true}`,
+		"base64Encoded": false,
+	})
+	if err != nil {
+		t.Fatalf("decodeSharedCDPResponseBody() error = %v", err)
+	}
+	if body != `{"success":true}` {
+		t.Fatalf("body = %q, want JSON payload", body)
+	}
+}
+
+func TestDecodeSharedCDPResponseBodyBase64(t *testing.T) {
+	body, err := decodeSharedCDPResponseBody(map[string]any{
+		"body":          base64.StdEncoding.EncodeToString([]byte(`{"success":true}`)),
+		"base64Encoded": true,
+	})
+	if err != nil {
+		t.Fatalf("decodeSharedCDPResponseBody() error = %v", err)
+	}
+	if body != `{"success":true}` {
+		t.Fatalf("body = %q, want decoded JSON payload", body)
 	}
 }

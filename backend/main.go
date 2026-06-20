@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1723,6 +1724,247 @@ func triggerBrowserFetch(page pw.Page, method, path string, payload map[string]a
 	return err
 }
 
+type sharedCDPRequestEvent struct {
+	RequestID string
+	Method    string
+	URL       string
+}
+
+type sharedCDPResponseEvent struct {
+	RequestID string
+	Status    int
+	URL       string
+}
+
+type sharedCDPFailureEvent struct {
+	RequestID string
+	ErrorText string
+}
+
+func parseSharedCDPRequestEvent(params map[string]any) sharedCDPRequestEvent {
+	request, _ := params["request"].(map[string]any)
+	return sharedCDPRequestEvent{
+		RequestID: browserFetchValueString(params["requestId"]),
+		Method:    strings.ToUpper(strings.TrimSpace(anyString(request["method"], ""))),
+		URL:       strings.TrimSpace(anyString(request["url"], "")),
+	}
+}
+
+func parseSharedCDPResponseEvent(params map[string]any) sharedCDPResponseEvent {
+	response, _ := params["response"].(map[string]any)
+	status := 0
+	switch value := response["status"].(type) {
+	case int:
+		status = value
+	case int64:
+		status = int(value)
+	case float64:
+		status = int(value)
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			status = int(parsed)
+		}
+	}
+	return sharedCDPResponseEvent{
+		RequestID: browserFetchValueString(params["requestId"]),
+		Status:    status,
+		URL:       strings.TrimSpace(anyString(response["url"], "")),
+	}
+}
+
+func parseSharedCDPFailureEvent(params map[string]any) sharedCDPFailureEvent {
+	return sharedCDPFailureEvent{
+		RequestID: browserFetchValueString(params["requestId"]),
+		ErrorText: strings.TrimSpace(anyString(params["errorText"], "")),
+	}
+}
+
+func decodeSharedCDPResponseBody(result any) (string, error) {
+	obj, ok := result.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("shared cdp response body returned unexpected payload type %T", result)
+	}
+	body := anyString(obj["body"], "")
+	base64Encoded, _ := obj["base64Encoded"].(bool)
+	if !base64Encoded {
+		return body, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(body)
+	if err != nil {
+		return "", fmt.Errorf("shared cdp response body base64 decode failed: %w", err)
+	}
+	return string(decoded), nil
+}
+
+func sharedCDPFetchStateSummary(request sharedCDPRequestEvent, response sharedCDPResponseEvent) string {
+	parts := make([]string, 0, 6)
+	if request.RequestID != "" {
+		parts = append(parts, "request_id="+request.RequestID)
+	}
+	if request.Method != "" {
+		parts = append(parts, "method="+request.Method)
+	}
+	if request.URL != "" {
+		parts = append(parts, "url="+request.URL)
+	}
+	if response.Status > 0 {
+		parts = append(parts, "status="+strconv.Itoa(response.Status))
+	}
+	return strings.Join(parts, " ")
+}
+
+func matchesSharedCDPRequest(event sharedCDPRequestEvent, method, url string) bool {
+	if event.RequestID == "" {
+		return false
+	}
+	if strings.ToUpper(strings.TrimSpace(method)) != strings.ToUpper(strings.TrimSpace(event.Method)) {
+		return false
+	}
+	return strings.TrimSpace(event.URL) == strings.TrimSpace(url)
+}
+
+func (app *App) sharedBrowserFetchViaCDP(ctx context.Context, page pw.Page, method, path string, payload map[string]any, accept, token string, timeout time.Duration) (int, string, error) {
+	session, err := page.Context().NewCDPSession(page)
+	if err != nil {
+		return 0, "", fmt.Errorf("browser shared cdp session failed: %w", err)
+	}
+	defer session.Detach()
+
+	if err := runBrowserStep(ctx, timeout, "cdp_network_enable", func() error {
+		_, sendErr := session.Send("Network.enable", map[string]any{})
+		return sendErr
+	}); err != nil {
+		return 0, "", fmt.Errorf("browser shared network enable failed: %w", err)
+	}
+
+	targetURL := sharedBrowserFetchResponseURL(path)
+	type fetchResult struct {
+		status int
+		body   string
+		err    error
+	}
+	resultCh := make(chan fetchResult, 1)
+	deliver := func(result fetchResult) {
+		select {
+		case resultCh <- result:
+		default:
+		}
+	}
+
+	var (
+		mu       sync.Mutex
+		request  sharedCDPRequestEvent
+		response sharedCDPResponseEvent
+	)
+
+	requestHandler := func(params map[string]any) {
+		event := parseSharedCDPRequestEvent(params)
+		if !matchesSharedCDPRequest(event, method, targetURL) {
+			return
+		}
+		mu.Lock()
+		if request.RequestID == "" {
+			request = event
+		}
+		current := request
+		mu.Unlock()
+		if current.RequestID == event.RequestID {
+			logInfo(app.logger, ctx, "共享CDP请求已匹配", "request_id", event.RequestID, "method", event.Method, "url", event.URL)
+		}
+	}
+
+	responseHandler := func(params map[string]any) {
+		event := parseSharedCDPResponseEvent(params)
+		mu.Lock()
+		if request.RequestID == "" || event.RequestID != request.RequestID {
+			mu.Unlock()
+			return
+		}
+		response = event
+		mu.Unlock()
+		logInfo(app.logger, ctx, "共享CDP响应已匹配", "request_id", event.RequestID, "status", event.Status, "url", event.URL)
+	}
+
+	finishedHandler := func(params map[string]any) {
+		requestID := browserFetchValueString(params["requestId"])
+		mu.Lock()
+		matchedRequest := request
+		matchedResponse := response
+		mu.Unlock()
+		if matchedRequest.RequestID == "" || matchedResponse.RequestID == "" || requestID != matchedRequest.RequestID {
+			return
+		}
+		go func() {
+			var body string
+			err := runBrowserStep(ctx, timeout, "cdp_response_body", func() error {
+				result, sendErr := session.Send("Network.getResponseBody", map[string]any{
+					"requestId": requestID,
+				})
+				if sendErr != nil {
+					return sendErr
+				}
+				decoded, decodeErr := decodeSharedCDPResponseBody(result)
+				if decodeErr != nil {
+					return decodeErr
+				}
+				body = decoded
+				return nil
+			})
+			if err != nil {
+				deliver(fetchResult{err: fmt.Errorf("browser shared response body failed: %w", err)})
+				return
+			}
+			deliver(fetchResult{status: matchedResponse.Status, body: body})
+		}()
+	}
+
+	failedHandler := func(params map[string]any) {
+		event := parseSharedCDPFailureEvent(params)
+		mu.Lock()
+		matchedRequest := request
+		mu.Unlock()
+		if matchedRequest.RequestID == "" || event.RequestID != matchedRequest.RequestID {
+			return
+		}
+		errorText := event.ErrorText
+		if errorText == "" {
+			errorText = "unknown network error"
+		}
+		deliver(fetchResult{err: fmt.Errorf("browser shared loading failed: %s", errorText)})
+	}
+
+	session.On("Network.requestWillBeSent", requestHandler)
+	session.On("Network.responseReceived", responseHandler)
+	session.On("Network.loadingFinished", finishedHandler)
+	session.On("Network.loadingFailed", failedHandler)
+	defer session.RemoveListener("Network.requestWillBeSent", requestHandler)
+	defer session.RemoveListener("Network.responseReceived", responseHandler)
+	defer session.RemoveListener("Network.loadingFinished", finishedHandler)
+	defer session.RemoveListener("Network.loadingFailed", failedHandler)
+
+	if err := runBrowserStep(ctx, timeout, "trigger_fetch", func() error {
+		return triggerBrowserFetch(page, method, path, payload, accept, token)
+	}); err != nil {
+		return 0, "", fmt.Errorf("browser shared trigger failed: %w", err)
+	}
+
+	select {
+	case <-ctx.Done():
+		mu.Lock()
+		summary := sharedCDPFetchStateSummary(request, response)
+		mu.Unlock()
+		if summary != "" {
+			return 0, "", fmt.Errorf("browser shared cdp timeout waiting for response: %w (%s)", ctx.Err(), summary)
+		}
+		return 0, "", fmt.Errorf("browser shared cdp timeout waiting for response: %w", ctx.Err())
+	case result := <-resultCh:
+		if result.err != nil {
+			return 0, "", result.err
+		}
+		return result.status, result.body, nil
+	}
+}
+
 func evaluateBrowserFetch(
 	ctx context.Context,
 	evaluate func(expr string, arg ...any) (any, error),
@@ -1992,28 +2234,7 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 		if sharedMode {
 			sharedBrowserFetchMu.Lock()
 			defer sharedBrowserFetchMu.Unlock()
-
-			responseURL := sharedBrowserFetchResponseURL(path)
-			resp, respErr := page.ExpectResponse(responseURL, func() error {
-				return triggerBrowserFetch(page, method, path, payload, accept, token)
-			}, pw.PageExpectResponseOptions{Timeout: pw.Float(float64(fetchTimeout / time.Millisecond))})
-			if respErr != nil {
-				fetchErr = fmt.Errorf("browser shared response wait failed: %w", respErr)
-			} else {
-				if finishErr := runBrowserStep(ctx, fetchTimeout, "response_finish", resp.Finished); finishErr != nil {
-					fetchErr = fmt.Errorf("browser shared response finish failed: %w", finishErr)
-				} else {
-					fetchStatus = resp.Status()
-					readErr := runBrowserStep(ctx, fetchTimeout, "response_body", func() error {
-						var textErr error
-						fetchBody, textErr = resp.Text()
-						return textErr
-					})
-					if readErr != nil {
-						fetchErr = fmt.Errorf("browser shared response body failed: %w", readErr)
-					}
-				}
-			}
+			fetchStatus, fetchBody, fetchErr = app.sharedBrowserFetchViaCDP(ctx, page, method, path, payload, accept, token, fetchTimeout)
 		} else {
 			fetchStatus, fetchBody, fetchErr = evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)
 		}
