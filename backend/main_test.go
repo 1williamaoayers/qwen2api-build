@@ -489,6 +489,23 @@ func TestBrowserPromptFromPayloadWithTypedMessageSlice(t *testing.T) {
 	}
 }
 
+func TestBrowserPromptFromPayloadStripsSynthesizedSystemScaffold(t *testing.T) {
+	payload := map[string]any{
+		"messages": []map[string]any{
+			{
+				"role": "user",
+				"content": "[System]\nClient-side tools are not available in this request.\n\n" +
+					"[System][WORKSPACE CONTEXT]\nUse the current working directory.\n[/WORKSPACE CONTEXT]\n\n" +
+					"[User]\nReply with exactly: QWEN2API-LIVE-OK",
+			},
+		},
+	}
+	got := browserPromptFromPayload(payload)
+	if got != "Reply with exactly: QWEN2API-LIVE-OK" {
+		t.Fatalf("browserPromptFromPayload() = %q", got)
+	}
+}
+
 func TestSharedBrowserFetchResponseURL(t *testing.T) {
 	if got := sharedBrowserFetchResponseURL("/api/v2/chats/new"); got != "https://chat.qwen.ai/api/v2/chats/new" {
 		t.Fatalf("sharedBrowserFetchResponseURL(relative) = %q", got)

@@ -1736,10 +1736,30 @@ func browserPromptFromPayload(payload map[string]any) string {
 			continue
 		}
 		if text := strings.TrimSpace(extractContentText(msg["content"])); text != "" {
-			return text
+			return extractSharedBrowserUserPrompt(text)
 		}
 	}
 	return ""
+}
+
+func extractSharedBrowserUserPrompt(text string) string {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	if text == "" {
+		return ""
+	}
+	userMarker := "\n[User]\n"
+	start := strings.LastIndex(text, userMarker)
+	if start >= 0 {
+		text = text[start+len(userMarker):]
+	} else if strings.HasPrefix(text, "[User]\n") {
+		text = strings.TrimPrefix(text, "[User]\n")
+	} else {
+		return text
+	}
+	if end := strings.Index(text, "\n\n["); end >= 0 {
+		text = text[:end]
+	}
+	return strings.TrimSpace(text)
 }
 
 func extractLatestSharedBrowserAnswer(raw string) string {
@@ -1784,7 +1804,11 @@ func (e playwrightSharedBrowserPromptEditor) Focus() error {
 }
 
 func (e playwrightSharedBrowserPromptEditor) Press(key string) error {
-	return e.locator.Press(key, pw.LocatorPressOptions{Timeout: pw.Float(10000)})
+	options := pw.LocatorPressOptions{Timeout: pw.Float(10000)}
+	if key == "Enter" {
+		options.NoWaitAfter = pw.Bool(true)
+	}
+	return e.locator.Press(key, options)
 }
 
 func (e playwrightSharedBrowserPromptEditor) PressSequentially(text string) error {
