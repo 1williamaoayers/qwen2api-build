@@ -1702,6 +1702,22 @@ func shouldUseSharedBrowserDOMCompletion(mode, path string) bool {
 	return normalizeLower(mode) == "shared_cdp" && strings.Contains(strings.TrimSpace(path), "/api/v2/chat/completions")
 }
 
+func sharedBrowserTargetURL(currentURL, chatID string) string {
+	currentURL = strings.TrimSpace(currentURL)
+	chatID = strings.TrimSpace(chatID)
+	if chatID != "" {
+		targetChatURL := qwenBaseURL + "/c/" + url.PathEscape(chatID)
+		if strings.TrimSpace(sharedChatIDFromPath(currentURL)) == chatID {
+			return currentURL
+		}
+		return targetChatURL
+	}
+	if strings.HasPrefix(currentURL, qwenBaseURL+"/") && currentURL != "" {
+		return currentURL
+	}
+	return qwenBaseURL + "/"
+}
+
 func sharedChatIDFromPath(path string) string {
 	raw := strings.TrimSpace(path)
 	if raw == "" {
@@ -1864,16 +1880,9 @@ func (app *App) sharedBrowserDOMCompletion(ctx context.Context, page pw.Page, ch
 		logWarn(app.logger, ctx, "共享浏览器标签置前失败", "error", err)
 	}
 	currentURL := strings.TrimSpace(page.URL())
-	targetURL := currentURL
-	switch {
-	case strings.HasPrefix(currentURL, qwenBaseURL+"/"):
-		targetURL = currentURL
-	case chatID != "":
-		targetURL = qwenBaseURL + "/c/" + url.PathEscape(chatID)
-	default:
-		targetURL = qwenBaseURL + "/"
-	}
-	if !strings.HasPrefix(currentURL, qwenBaseURL+"/") || currentURL == "" {
+	targetURL := sharedBrowserTargetURL(currentURL, chatID)
+	if currentURL != targetURL {
+		logInfo(app.logger, ctx, "共享浏览器会话页切换", "from", firstNonEmpty(currentURL, "-"), "to", targetURL, "chat_id", firstNonEmpty(chatID, "-"))
 		if err := runBrowserStep(ctx, 30*time.Second, "goto_shared_chat", func() error {
 			_, err := page.Goto(targetURL, pw.PageGotoOptions{
 				WaitUntil: pw.WaitUntilStateDomcontentloaded,

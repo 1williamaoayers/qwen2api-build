@@ -461,6 +461,28 @@ func TestSharedChatIDFromPath(t *testing.T) {
 	}
 }
 
+func TestSharedBrowserTargetURL(t *testing.T) {
+	same := sharedBrowserTargetURL("https://chat.qwen.ai/c/abc-123", "abc-123")
+	if same != "https://chat.qwen.ai/c/abc-123" {
+		t.Fatalf("sharedBrowserTargetURL(same chat) = %q", same)
+	}
+
+	switched := sharedBrowserTargetURL("https://chat.qwen.ai/c/old-chat", "new-chat")
+	if switched != "https://chat.qwen.ai/c/new-chat" {
+		t.Fatalf("sharedBrowserTargetURL(mismatched chat) = %q", switched)
+	}
+
+	fromHome := sharedBrowserTargetURL("https://chat.qwen.ai/", "fresh-chat")
+	if fromHome != "https://chat.qwen.ai/c/fresh-chat" {
+		t.Fatalf("sharedBrowserTargetURL(home to chat) = %q", fromHome)
+	}
+
+	fromOther := sharedBrowserTargetURL("https://example.com/", "")
+	if fromOther != "https://chat.qwen.ai/" {
+		t.Fatalf("sharedBrowserTargetURL(other page) = %q", fromOther)
+	}
+}
+
 func TestBrowserPromptFromPayload(t *testing.T) {
 	payload := map[string]any{
 		"messages": []any{
