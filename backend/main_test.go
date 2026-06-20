@@ -365,11 +365,43 @@ func TestShouldUseSharedBrowserEvaluateFetch(t *testing.T) {
 }
 
 func TestShouldUseSharedBrowserDirectRequest(t *testing.T) {
-	if !shouldUseSharedBrowserDirectRequest("shared_cdp") {
-		t.Fatal("shared_cdp should use shared browser direct request strategy")
+	if !shouldUseSharedBrowserDirectRequest("shared_cdp", "/api/v2/chats/new") {
+		t.Fatal("shared_cdp create chat should use shared browser direct request strategy")
 	}
-	if shouldUseSharedBrowserDirectRequest("embedded") {
+	if shouldUseSharedBrowserDirectRequest("shared_cdp", "/api/v2/chat/completions?chat_id=abc") {
+		t.Fatal("shared_cdp completions should not use shared browser direct request strategy")
+	}
+	if shouldUseSharedBrowserDirectRequest("embedded", "/api/v2/chats/new") {
 		t.Fatal("embedded mode should not use shared browser direct request strategy")
+	}
+}
+
+func TestShouldUseSharedBrowserDOMCompletion(t *testing.T) {
+	if !shouldUseSharedBrowserDOMCompletion("shared_cdp", "/api/v2/chat/completions?chat_id=abc") {
+		t.Fatal("shared_cdp completions should use shared browser DOM strategy")
+	}
+	if shouldUseSharedBrowserDOMCompletion("shared_cdp", "/api/v2/chats/new") {
+		t.Fatal("shared_cdp create chat should not use shared browser DOM strategy")
+	}
+}
+
+func TestSharedChatIDFromPath(t *testing.T) {
+	got := sharedChatIDFromPath("/api/v2/chat/completions?chat_id=abc-123&foo=bar")
+	if got != "abc-123" {
+		t.Fatalf("sharedChatIDFromPath() = %q, want abc-123", got)
+	}
+}
+
+func TestBrowserPromptFromPayload(t *testing.T) {
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "system", "content": "ignore"},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "Reply with exactly: DOM-OK"}}},
+		},
+	}
+	got := browserPromptFromPayload(payload)
+	if got != "Reply with exactly: DOM-OK" {
+		t.Fatalf("browserPromptFromPayload() = %q", got)
 	}
 }
 

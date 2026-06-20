@@ -1694,8 +1694,166 @@ func shouldUseSharedBrowserEvaluateFetch(mode string) bool {
 	return false
 }
 
-func shouldUseSharedBrowserDirectRequest(mode string) bool {
-	return normalizeLower(mode) == "shared_cdp"
+func shouldUseSharedBrowserDirectRequest(mode, path string) bool {
+	return normalizeLower(mode) == "shared_cdp" && !shouldUseSharedBrowserDOMCompletion(mode, path)
+}
+
+func shouldUseSharedBrowserDOMCompletion(mode, path string) bool {
+	return normalizeLower(mode) == "shared_cdp" && strings.Contains(strings.TrimSpace(path), "/api/v2/chat/completions")
+}
+
+func sharedChatIDFromPath(path string) string {
+	raw := strings.TrimSpace(path)
+	if raw == "" {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		raw = qwenBaseURL + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Query().Get("chat_id"))
+}
+
+func browserPromptFromPayload(payload map[string]any) string {
+	items := anyList(payload["messages"])
+	for i := len(items) - 1; i >= 0; i-- {
+		msg, ok := items[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if role := strings.TrimSpace(stringValue(msg, "role", "user")); role != "" && role != "user" {
+			continue
+		}
+		if text := strings.TrimSpace(extractContentText(msg["content"])); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func extractLatestSharedBrowserAnswer(raw string) string {
+	raw = strings.ReplaceAll(strings.TrimSpace(raw), "\r\n", "\n")
+	if raw == "" {
+		return ""
+	}
+	idx := strings.LastIndex(raw, "Thinking completed")
+	if idx < 0 {
+		return ""
+	}
+	tail := strings.TrimSpace(raw[idx+len("Thinking completed"):])
+	if tail == "" {
+		return ""
+	}
+	for _, cut := range []string{
+		"\nAuto\nAI-generated content may not be accurate.",
+		"\nAI-generated content may not be accurate.",
+		"\nAccess Verification",
+		"\nDownload App",
+	} {
+		if pos := strings.Index(tail, cut); pos >= 0 {
+			tail = strings.TrimSpace(tail[:pos])
+		}
+	}
+	return strings.TrimSpace(tail)
+}
+
+func (app *App) sharedBrowserDOMCompletion(ctx context.Context, page pw.Page, chatID, prompt string, timeout time.Duration) (string, error) {
+	chatID = strings.TrimSpace(chatID)
+	prompt = strings.TrimSpace(prompt)
+	if chatID == "" {
+		return "", errors.New("shared browser DOM completion missing chat_id")
+	}
+	if prompt == "" {
+		return "", errors.New("shared browser DOM completion missing prompt")
+	}
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	targetURL := qwenBaseURL + "/c/" + url.PathEscape(chatID)
+	if err := runBrowserStep(ctx, 30*time.Second, "goto_shared_chat", func() error {
+		_, err := page.Goto(targetURL, pw.PageGotoOptions{
+			WaitUntil: pw.WaitUntilStateDomcontentloaded,
+			Timeout:   pw.Float(30000),
+		})
+		return err
+	}); err != nil {
+		return "", fmt.Errorf("browser goto shared chat failed: %w", err)
+	}
+	if _, err := page.WaitForSelector(`textarea.message-input-textarea`, pw.PageWaitForSelectorOptions{Timeout: pw.Float(20000)}); err != nil {
+		return "", fmt.Errorf("browser textarea not ready: %w", err)
+	}
+	baselineRaw, err := page.Evaluate(`() => {
+		return Array.from(document.querySelectorAll('.response-message-content.t2t.phase-answer'))
+			.map((el) => (el && el.innerText) ? el.innerText.trim() : '')
+			.filter(Boolean);
+	}`)
+	if err != nil {
+		return "", fmt.Errorf("browser baseline answer scan failed: %w", err)
+	}
+	baselineCount := 0
+	if items, ok := baselineRaw.([]any); ok {
+		baselineCount = len(items)
+	}
+	if err := page.Fill(`textarea.message-input-textarea`, prompt, pw.PageFillOptions{Timeout: pw.Float(10000)}); err != nil {
+		return "", fmt.Errorf("browser fill prompt failed: %w", err)
+	}
+	if err := page.Press(`textarea.message-input-textarea`, "Enter"); err != nil {
+		return "", fmt.Errorf("browser submit prompt failed: %w", err)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		raw, err := page.Evaluate(`baselineCount => {
+			const bodyText = (document.body && document.body.innerText) ? document.body.innerText.trim() : '';
+			const answers = Array.from(document.querySelectorAll('.response-message-content.t2t.phase-answer'))
+				.map((el) => (el && el.innerText) ? el.innerText.trim() : '')
+				.filter(Boolean);
+			const captchaVisible = Array.from(document.querySelectorAll('*')).some((el) => {
+				if (!(el instanceof HTMLElement)) return false;
+				const text = (el.innerText || '').trim();
+				if (!text) return false;
+				const style = globalThis.getComputedStyle ? getComputedStyle(el) : null;
+				if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+				return text.includes('Access Verification') || text.includes('Drag to complete the puzzle');
+			});
+			return {
+				answerCount: answers.length,
+				lastAnswer: answers.length > 0 ? answers[answers.length - 1] : '',
+				bodyTail: bodyText.slice(-2000),
+				captchaVisible,
+				done: answers.length > baselineCount && !!(answers[answers.length - 1] || '').trim(),
+			};
+		}`, baselineCount)
+		if err != nil {
+			return "", fmt.Errorf("browser poll completion failed: %w", err)
+		}
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("browser poll returned unexpected payload type %T", raw)
+		}
+		if visible, _ := obj["captchaVisible"].(bool); visible {
+			return "", errors.New("shared browser DOM completion blocked by access verification")
+		}
+		if done, _ := obj["done"].(bool); done {
+			answer := strings.TrimSpace(anyString(obj["lastAnswer"], ""))
+			if answer == "" {
+				answer = extractLatestSharedBrowserAnswer(anyString(obj["bodyTail"], ""))
+			}
+			if answer != "" {
+				return answer, nil
+			}
+		}
+		sleepWithContext(ctx, time.Second)
+	}
+	if snapshot, snapErr := browserPageStateSummary(page); snapErr == nil {
+		return "", fmt.Errorf("shared browser DOM completion timeout after %dms (%s)", timeout.Milliseconds(), snapshot)
+	}
+	return "", fmt.Errorf("shared browser DOM completion timeout after %dms", timeout.Milliseconds())
 }
 
 func truncateForLog(value string, limit int) string {
@@ -2274,7 +2432,14 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 			fetchBody   string
 			fetchErr    error
 		)
-		if shouldUseSharedBrowserDirectRequest(app.settings.BrowserMode) {
+		if shouldUseSharedBrowserDOMCompletion(app.settings.BrowserMode, path) {
+			sharedBrowserFetchMu.Lock()
+			defer sharedBrowserFetchMu.Unlock()
+			fetchBody, fetchErr = app.sharedBrowserDOMCompletion(ctx, page, sharedChatIDFromPath(path), browserPromptFromPayload(payload), fetchTimeout)
+			if fetchErr == nil {
+				fetchStatus = http.StatusOK
+			}
+		} else if shouldUseSharedBrowserDirectRequest(app.settings.BrowserMode, path) {
 			sharedBrowserFetchMu.Lock()
 			liveToken := strings.TrimSpace(localStorageToken(page))
 			liveCookies := strings.TrimSpace(qwenCookieString(page))
