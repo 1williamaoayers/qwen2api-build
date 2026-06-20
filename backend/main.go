@@ -1417,7 +1417,7 @@ func evaluateBrowserFetch(
 			return res.value, nil
 		}
 	}
-	if _, err := runEvaluate(`({ jobId, method, path, payload, accept, token, timeoutMs }) => {
+	launchResult, err := runEvaluate(`({ jobId, method, path, payload, accept, token, timeoutMs }) => {
 		const root = globalThis;
 		if (!root.__qwen2apiFetchJobs) {
 			root.__qwen2apiFetchJobs = Object.create(null);
@@ -1470,8 +1470,14 @@ func evaluateBrowserFetch(
 		"accept":    accept,
 		"token":     token,
 		"timeoutMs": timeoutMs,
-	}); err != nil {
+	})
+	if err != nil {
 		return 0, "", err
+	}
+	if direct, ok := launchResult.(map[string]any); ok {
+		if _, hasDone := direct["done"]; !hasDone {
+			return parseBrowserFetchResult(direct)
+		}
 	}
 	pollInterval := 100 * time.Millisecond
 	if timeoutMs < 100 {
@@ -1500,6 +1506,9 @@ func evaluateBrowserFetch(
 		obj, ok := result.(map[string]any)
 		if !ok {
 			return 0, "", fmt.Errorf("browser fetch returned unexpected payload type %T", result)
+		}
+		if _, hasDone := obj["done"]; !hasDone {
+			return parseBrowserFetchResult(obj)
 		}
 		done, _ := obj["done"].(bool)
 		if !done {
