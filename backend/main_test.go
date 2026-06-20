@@ -153,6 +153,11 @@ func TestEvaluateBrowserFetchReportsAbortTimeout(t *testing.T) {
 			"error":     "browser fetch timeout after 30000ms",
 			"name":      "AbortError",
 			"timed_out": true,
+			"lastStage": "fetch_error",
+			"trace": []any{
+				map[string]any{"stage": "created", "elapsedMs": float64(0)},
+				map[string]any{"stage": "fetch_error", "elapsedMs": float64(12), "error": "The operation was aborted."},
+			},
 		}, nil
 	}
 
@@ -177,6 +182,9 @@ func TestEvaluateBrowserFetchReportsAbortTimeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "30000ms") {
 		t.Fatalf("error = %q, want timeout detail", err)
+	}
+	if !strings.Contains(err.Error(), "stage=fetch_error") {
+		t.Fatalf("error = %q, want stage detail", err)
 	}
 }
 
@@ -246,5 +254,50 @@ func TestEvaluateBrowserFetchReturnsContextTimeoutWhenPollHangs(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "browser evaluate timeout") {
 		t.Fatalf("error = %q, want evaluate timeout detail", err)
+	}
+}
+
+func TestEvaluateBrowserFetchReturnsTraceWhenJobNeverCompletes(t *testing.T) {
+	t.Helper()
+	call := 0
+	evaluator := func(expr string, arg ...any) (any, error) {
+		call++
+		if call == 1 {
+			return true, nil
+		}
+		return map[string]any{
+			"done":      false,
+			"lastStage": "fetch_started",
+			"trace": []any{
+				map[string]any{"stage": "created", "elapsedMs": float64(0)},
+				map[string]any{"stage": "fetch_started", "elapsedMs": float64(5)},
+			},
+		}, nil
+	}
+
+	status, body, err := evaluateBrowserFetch(
+		context.Background(),
+		evaluator,
+		http.MethodPost,
+		"/api/v2/chats/new",
+		map[string]any{"foo": "bar"},
+		"application/json",
+		"token-123",
+		30*time.Millisecond,
+	)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if status != 0 {
+		t.Fatalf("status = %d, want 0", status)
+	}
+	if body != "" {
+		t.Fatalf("body = %q, want empty", body)
+	}
+	if !strings.Contains(err.Error(), "stage=fetch_started") {
+		t.Fatalf("error = %q, want stage detail", err)
+	}
+	if !strings.Contains(err.Error(), "trace=created@0ms -> fetch_started@5ms") {
+		t.Fatalf("error = %q, want trace detail", err)
 	}
 }

@@ -1381,6 +1381,215 @@ func parseCookiePairs(raw string) []pw.OptionalCookie {
 	return out
 }
 
+func attachBrowserDebugHooks(logger *slog.Logger, ctx context.Context, page pw.Page) {
+	page.OnConsole(func(msg pw.ConsoleMessage) {
+		text := strings.TrimSpace(msg.Text())
+		if text == "" {
+			return
+		}
+		loc := msg.Location()
+		location := ""
+		if loc != nil {
+			location = fmt.Sprintf("%s:%d:%d", strings.TrimSpace(loc.URL), loc.LineNumber, loc.ColumnNumber)
+		}
+		logInfo(logger, ctx, "浏览器console",
+			"console_type", msg.Type(),
+			"text", truncateForLog(text, 240),
+			"location", location,
+		)
+	})
+	page.OnPageError(func(err error) {
+		logWarn(logger, ctx, "浏览器pageerror", "error", err)
+	})
+	page.OnRequest(func(req pw.Request) {
+		if !shouldLogBrowserNetworkEvent(req.URL(), req.ResourceType(), req.IsNavigationRequest()) {
+			return
+		}
+		logInfo(logger, ctx, "浏览器request",
+			"method", req.Method(),
+			"url", req.URL(),
+			"resource_type", req.ResourceType(),
+			"navigation", req.IsNavigationRequest(),
+		)
+	})
+	page.OnResponse(func(resp pw.Response) {
+		url := resp.URL()
+		resourceType := ""
+		if req := resp.Request(); req != nil {
+			resourceType = req.ResourceType()
+		}
+		if !shouldLogBrowserNetworkEvent(url, resourceType, false) {
+			return
+		}
+		contentType, _ := resp.HeaderValue("content-type")
+		logInfo(logger, ctx, "浏览器response",
+			"status", resp.Status(),
+			"url", url,
+			"resource_type", resourceType,
+			"content_type", strings.TrimSpace(contentType),
+		)
+	})
+	page.OnRequestFinished(func(req pw.Request) {
+		if !shouldLogBrowserNetworkEvent(req.URL(), req.ResourceType(), req.IsNavigationRequest()) {
+			return
+		}
+		logInfo(logger, ctx, "浏览器request完成",
+			"method", req.Method(),
+			"url", req.URL(),
+			"resource_type", req.ResourceType(),
+		)
+	})
+	page.OnRequestFailed(func(req pw.Request) {
+		if !shouldLogBrowserNetworkEvent(req.URL(), req.ResourceType(), req.IsNavigationRequest()) {
+			return
+		}
+		logWarn(logger, ctx, "浏览器request失败",
+			"method", req.Method(),
+			"url", req.URL(),
+			"resource_type", req.ResourceType(),
+			"error", req.Failure(),
+		)
+	})
+}
+
+func shouldLogBrowserNetworkEvent(rawURL, resourceType string, navigation bool) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" || !strings.Contains(rawURL, "chat.qwen.ai") {
+		return false
+	}
+	if strings.Contains(rawURL, "/api/") {
+		return true
+	}
+	if navigation {
+		return true
+	}
+	switch strings.TrimSpace(resourceType) {
+	case "document", "fetch", "xhr":
+		return true
+	default:
+		return false
+	}
+}
+
+func browserPageStateSummary(page pw.Page) (string, error) {
+	raw, err := page.Evaluate(`() => {
+		const bodyText = document.body ? (document.body.innerText || document.body.textContent || '') : '';
+		return {
+			href: location.href || '',
+			title: document.title || '',
+			readyState: document.readyState || '',
+			webdriver: !!navigator.webdriver,
+			tokenPresent: !!localStorage.getItem('token'),
+			cookieBytes: document.cookie ? document.cookie.length : 0,
+			bodyExcerpt: bodyText.replace(/\s+/g, ' ').trim().slice(0, 180),
+		};
+	}`)
+	if err != nil {
+		return "", err
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Sprintf("unexpected_page_state_type=%T", raw), nil
+	}
+	return fmt.Sprintf(
+		"href=%s ready=%s title=%q webdriver=%v token=%v cookie_bytes=%v body=%q",
+		anyString(obj["href"], ""),
+		anyString(obj["readyState"], ""),
+		anyString(obj["title"], ""),
+		obj["webdriver"],
+		obj["tokenPresent"],
+		obj["cookieBytes"],
+		anyString(obj["bodyExcerpt"], ""),
+	), nil
+}
+
+func browserFetchStateSummary(obj map[string]any) string {
+	if len(obj) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 6)
+	if stage := anyString(obj["lastStage"], ""); stage != "" {
+		parts = append(parts, "stage="+stage)
+	}
+	if status := browserFetchValueString(obj["status"]); status != "" {
+		parts = append(parts, "status="+status)
+	}
+	if url := anyString(obj["url"], ""); url != "" {
+		parts = append(parts, "url="+url)
+	}
+	if bodyBytes := browserFetchValueString(obj["bodyBytes"]); bodyBytes != "" {
+		parts = append(parts, "body_bytes="+bodyBytes)
+	}
+	if trace := browserFetchTraceSummary(obj["trace"]); trace != "" {
+		parts = append(parts, "trace="+trace)
+	}
+	if missing, _ := obj["missing"].(bool); missing {
+		parts = append(parts, "missing=true")
+	}
+	return strings.Join(parts, " ")
+}
+
+func browserFetchTraceSummary(value any) string {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		stage := anyString(obj["stage"], "")
+		if stage == "" {
+			continue
+		}
+		part := stage
+		if status := browserFetchValueString(obj["status"]); status != "" {
+			part += ":" + status
+		}
+		if errorText := anyString(obj["error"], ""); errorText != "" {
+			part += ":" + truncateForLog(errorText, 80)
+		}
+		if elapsed := browserFetchValueString(obj["elapsedMs"]); elapsed != "" {
+			part += "@" + elapsed + "ms"
+		}
+		parts = append(parts, part)
+		if len(parts) >= 8 {
+			break
+		}
+	}
+	return strings.Join(parts, " -> ")
+}
+
+func browserFetchValueString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	case json.Number:
+		return v.String()
+	default:
+		return ""
+	}
+}
+
+func truncateForLog(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return value[:limit]
+	}
+	return value[:limit-3] + "..."
+}
+
 func evaluateBrowserFetch(
 	ctx context.Context,
 	evaluate func(expr string, arg ...any) (any, error),
@@ -1422,11 +1631,37 @@ func evaluateBrowserFetch(
 		if (!root.__qwen2apiFetchJobs) {
 			root.__qwen2apiFetchJobs = Object.create(null);
 		}
-		root.__qwen2apiFetchJobs[jobId] = { done: false, startedAt: Date.now() };
+		const startedAt = Date.now();
+		const job = root.__qwen2apiFetchJobs[jobId] = {
+			done: false,
+			startedAt,
+			lastStage: 'created',
+			trace: [],
+		};
+		const record = (stage, extra = {}) => {
+			job.lastStage = stage;
+			job.trace.push({
+				stage,
+				elapsedMs: Date.now() - startedAt,
+				...extra,
+			});
+			if (job.trace.length > 12) {
+				job.trace = job.trace.slice(-12);
+			}
+		};
+		record('created', {
+			href: location.href || '',
+			readyState: document.readyState || '',
+			requestUrl: String(new URL(path, location.href || 'https://chat.qwen.ai/')),
+		});
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
 		(async () => {
 			try {
+				record('fetch_started', {
+					href: location.href || '',
+					readyState: document.readyState || '',
+				});
 				const response = await fetch(path, {
 					method,
 					credentials: 'include',
@@ -1438,25 +1673,36 @@ func evaluateBrowserFetch(
 					},
 					body: payload ? JSON.stringify(payload) : undefined,
 				});
-				const body = await response.text();
-				root.__qwen2apiFetchJobs[jobId] = {
-					done: true,
-					ok: true,
+				record('fetch_response', {
 					status: response.status,
-					body,
+					ok: response.ok,
 					url: response.url || '',
-				};
+				});
+				const body = await response.text();
+				record('fetch_body', {
+					status: response.status,
+					bodyBytes: body.length,
+				});
+				job.done = true;
+				job.ok = true;
+				job.status = response.status;
+				job.body = body;
+				job.bodyBytes = body.length;
+				job.url = response.url || '';
 			} catch (error) {
 				const name = error && typeof error === 'object' && 'name' in error ? String(error.name) : '';
 				const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error || 'unknown browser fetch error');
 				const timedOut = name === 'AbortError' || controller.signal.aborted;
-				root.__qwen2apiFetchJobs[jobId] = {
-					done: true,
-					ok: false,
-					error: timedOut ? 'browser fetch timeout after ' + timeoutMs + 'ms' : message,
+				record('fetch_error', {
 					name,
-					timed_out: timedOut,
-				};
+					error: message,
+					aborted: controller.signal.aborted,
+				});
+				job.done = true;
+				job.ok = false;
+				job.error = timedOut ? 'browser fetch timeout after ' + timeoutMs + 'ms' : message;
+				job.name = name;
+				job.timed_out = timedOut;
 			} finally {
 				clearTimeout(timer);
 			}
@@ -1495,7 +1741,7 @@ func evaluateBrowserFetch(
 				return { done: false, missing: true };
 			}
 			if (!job.done) {
-				return { done: false };
+				return job;
 			}
 			delete root.__qwen2apiFetchJobs[jobId];
 			return job;
@@ -1513,6 +1759,9 @@ func evaluateBrowserFetch(
 		done, _ := obj["done"].(bool)
 		if !done {
 			if time.Now().After(deadline) {
+				if summary := browserFetchStateSummary(obj); summary != "" {
+					return 0, "", fmt.Errorf("browser evaluate timeout after %dms: context deadline exceeded (%s)", timeoutMs, summary)
+				}
 				return 0, "", fmt.Errorf("browser evaluate timeout after %dms: context deadline exceeded", timeoutMs)
 			}
 			sleepWithContext(ctx, pollInterval)
@@ -1525,7 +1774,11 @@ func evaluateBrowserFetch(
 func parseBrowserFetchResult(obj map[string]any) (int, string, error) {
 	okValue, _ := obj["ok"].(bool)
 	if !okValue {
-		return 0, "", errors.New(anyString(obj["error"], "browser fetch failed"))
+		message := anyString(obj["error"], "browser fetch failed")
+		if summary := browserFetchStateSummary(obj); summary != "" {
+			message += " (" + summary + ")"
+		}
+		return 0, "", errors.New(message)
 	}
 	var status int
 	switch v := obj["status"].(type) {
@@ -1556,10 +1809,12 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 		body   string
 	)
 	err := app.withBrowser(ctx, func(page pw.Page) error {
+		attachBrowserDebugHooks(app.logger, ctx, page)
 		if parsed := parseCookiePairs(cookies); len(parsed) > 0 {
 			if err := page.Context().AddCookies(parsed); err != nil {
 				return fmt.Errorf("browser add cookies failed: %w", err)
 			}
+			logInfo(app.logger, ctx, "浏览器cookies已注入", "cookie_count", len(parsed))
 		}
 		if _, err := page.Goto(qwenBaseURL+"/", pw.PageGotoOptions{
 			WaitUntil: pw.WaitUntilStateDomcontentloaded,
@@ -1567,12 +1822,22 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 		}); err != nil {
 			return fmt.Errorf("browser goto qwen failed: %w", err)
 		}
+		if snapshot, snapErr := browserPageStateSummary(page); snapErr != nil {
+			logWarn(app.logger, ctx, "浏览器页面快照失败", "stage", "after_goto", "error", snapErr)
+		} else {
+			logInfo(app.logger, ctx, "浏览器页面快照", "stage", "after_goto", "page_state", snapshot)
+		}
 		if token != "" {
 			if _, err := page.Evaluate(`token => {
 				localStorage.setItem('token', token);
 				return true;
 			}`, token); err != nil {
 				return fmt.Errorf("browser set localStorage token failed: %w", err)
+			}
+			if snapshot, snapErr := browserPageStateSummary(page); snapErr != nil {
+				logWarn(app.logger, ctx, "浏览器页面快照失败", "stage", "after_token", "error", snapErr)
+			} else {
+				logInfo(app.logger, ctx, "浏览器页面快照", "stage", "after_token", "page_state", snapshot)
 			}
 		}
 		fetchTimeout := timeout
@@ -1582,6 +1847,11 @@ func (app *App) browserFetchQwen(ctx context.Context, token, cookies, method, pa
 		logInfo(app.logger, ctx, "浏览器上游请求开始", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "has_cookies", strings.TrimSpace(cookies) != "")
 		fetchStatus, fetchBody, err := evaluateBrowserFetch(ctx, page.Evaluate, method, path, payload, accept, token, fetchTimeout)
 		if err != nil {
+			if snapshot, snapErr := browserPageStateSummary(page); snapErr != nil {
+				logWarn(app.logger, ctx, "浏览器页面快照失败", "stage", "after_fetch_error", "error", snapErr)
+			} else {
+				logWarn(app.logger, ctx, "浏览器页面快照", "stage", "after_fetch_error", "page_state", snapshot)
+			}
 			logWarn(app.logger, ctx, "浏览器上游请求失败", "method", method, "path", path, "timeout_ms", fetchTimeout.Milliseconds(), "error", err)
 			return err
 		}
